@@ -95,35 +95,23 @@ ${resultContent.slice(0, 2000)}
 Respond with ONLY valid JSON in this exact format:
 {"title": "Your Title Here", "description": "Your description here."}`
 
-		await client.session.prompt({
-			path: { id: session.data.id },
-			body: {
-				parts: [{ type: "text", text: prompt }],
-			},
-		})
+		// Await prompt response directly with timeout safety net
+		const PROMPT_TIMEOUT_MS = 30000
+		const result = await Promise.race([
+			client.session.prompt({
+				path: { id: session.data.id },
+				body: {
+					parts: [{ type: "text", text: prompt }],
+				},
+			}),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("Prompt timeout after 30s")), PROMPT_TIMEOUT_MS),
+			),
+		])
 
-		// Wait briefly for completion
-		await new Promise((resolve) => setTimeout(resolve, 3000))
-
-		// Get the response
-		const messages = await client.session.messages({
-			path: { id: session.data.id },
-		})
-
-		const messageData = messages.data as SessionMessageItem[] | undefined
-		if (!messageData || messageData.length === 0) {
-			await debugLog("generateMetadata: No messages in session")
-			return fallbackMetadata()
-		}
-
-		// Find assistant response
-		const assistantMsg = messageData.find((m) => m.info.role === "assistant")
-		if (!assistantMsg) {
-			await debugLog("generateMetadata: No assistant message")
-			return fallbackMetadata()
-		}
-
-		const textPart = assistantMsg.parts.find((p): p is TextPart => p.type === "text")
+		// Extract text from the response
+		const responseParts = result.data?.parts as TextPart[] | undefined
+		const textPart = responseParts?.find((p): p is TextPart => p.type === "text")
 		if (!textPart) {
 			await debugLog("generateMetadata: No text part in response")
 			return fallbackMetadata()
