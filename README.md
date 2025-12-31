@@ -15,7 +15,7 @@ A plugin for [OpenCode](https://github.com/sst/opencode) that enables background
 
 ## Part of KDCO
 
-This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco) - the ShadCN for OpenCode. It works great standalone, but for the full experience we recommend `kdco-workspace`, which bundles background agents with specialist agents, planning tools, and research protocols.
+This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco), a collection of plugins, agents, and skills for OpenCode. It works great standalone, but for the full experience we recommend `kdco-workspace`, which bundles background agents with specialist agents, planning tools, and research protocols.
 
 ## Installation (Recommended)
 
