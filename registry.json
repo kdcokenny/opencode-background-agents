@@ -1,0 +1,30 @@
+{
+  "$schema": "https://ocx.kdco.dev/schema/registry.json",
+  "name": "kdco-background-agents",
+  "description": "Async background agents for OpenCode - lightweight delegation system",
+  "components": [
+    {
+      "name": "kdco-background-agents",
+      "description": "Async delegation system with waiter model - run parallel tasks using specialized agents",
+      "type": "ocx:plugin",
+      "files": [
+        {
+          "path": "src/plugin/kdco-background-agents.ts",
+          "target": "plugin/kdco-background-agents.ts"
+        }
+      ],
+      "skills": ["kdco-background-protocol"]
+    },
+    {
+      "name": "kdco-background-protocol",
+      "description": "Guidelines for effective background agent delegation",
+      "type": "ocx:skill",
+      "files": [
+        {
+          "path": "src/skill/kdco-background-protocol/SKILL.md",
+          "target": "skill/kdco-background-protocol/SKILL.md"
+        }
+      ]
+    }
+  ]
+}
