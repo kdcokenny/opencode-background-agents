@@ -1,71 +1,102 @@
-# OpenCode Background Agents
+# opencode-background-agents
 
-Async delegation system for [OpenCode](https://opencode.ai). Run parallel research tasks using the waiter model while you continue working.
+> The ShadCN for AI coding agents. Async delegation that just works.
 
-## Installation
+A plugin for [OpenCode](https://github.com/sst/opencode) that enables background task delegation using the "waiter model" - fire off tasks to specialist agents, continue working, and get notified when results are ready.
 
-### CLI (Recommended)
+## What is this?
+
+`opencode-background-agents` replaces the native `task` tool with a persistent, async-first delegation system:
+
+- **Fire-and-forget** - Launch tasks and immediately continue working
+- **Waiter model** - You don't follow the waiter to the kitchen. Notifications arrive when ready.
+- **Persistent results** - Delegation outputs are saved and survive context compaction
+- **Human-readable IDs** - Results indexed by memorable names like `elegant-blue-tiger`
+
+## Part of KDCO
+
+This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco) - a collection of AI agent components for OpenCode. It works great standalone, but for the full experience we recommend `kdco-workspace`, which bundles background agents with specialist agents, planning tools, and research protocols.
+
+## Installation (Recommended)
+
+Install via [OCX](https://github.com/kdcokenny/ocx), the package manager for OpenCode extensions:
 
 ```bash
-npx ocx add kdco/kdco-background-agents
+# Install OCX
+curl -fsSL https://ocx.kdco.dev/install.sh | sh
+# Or: npm install -g ocx
+
+# Initialize OCX in your project
+ocx init
+
+# Add the KDCO registry
+ocx registry add --name kdco https://registry.kdco.dev
+
+# Install background agents
+ocx add kdco-background-agents
 ```
 
-### Manual
+Want the full workspace instead? It includes background agents plus specialist agents and protocols:
 
-Copy files from `src/` to your project's `.opencode/` directory:
+```bash
+ocx add kdco-workspace
+```
 
-```
-.opencode/
-├── plugin/
-│   └── kdco-background-agents.ts
-└── skill/
-    └── kdco-background-protocol/
-        └── SKILL.md
-```
+## Manual Installation
+
+You can copy the source files directly into your `.opencode/` directory if you prefer not to use OCX.
+
+**Caveats:**
+- You'll need to manually install dependencies (`unique-names-generator`)
+- Updates require manual re-copying
+- Dependency resolution is your responsibility
+
+The source is in [`src/`](./src) - copy the plugin file to `.opencode/plugin/kdco-background-agents.ts`.
 
 ## Features
 
-- **Waiter Model** - Delegate tasks and get notified when complete. No polling.
-- **Parallel Execution** - Launch multiple agents simultaneously for faster research.
-- **Persistent Results** - Delegation outputs survive across sessions.
-- **Event-Driven** - System notifications tell you when work is done.
+### The Waiter Model
+
+Traditional task delegation blocks your workflow. Background agents work differently:
+
+1. **Order** - Request work with clear instructions
+2. **Trust** - The agent handles it while you continue working
+3. **Delivery** - A notification arrives with the complete result
+
+### Event-Driven Notifications
+
+No polling. When delegations complete, you receive a `<system-reminder>` with:
+- Human-readable ID
+- Auto-generated title and description
+- Status (complete, timeout, or error)
+
+### Persistent Results
+
+All delegation outputs are persisted to `~/.local/share/opencode/delegations/`. Results survive:
+- Context compaction
+- Session restarts
+- Process crashes
+
+Retrieve any result with `delegation_read("elegant-blue-tiger")`.
 
 ## Usage
 
-Once installed, you have access to three tools:
+The plugin adds three tools:
 
-| Tool | Description |
-|------|-------------|
-| `delegate` | Launch a background agent with a task |
-| `delegation_list` | List all delegations for the session |
-| `delegation_read` | Retrieve results from a completed delegation |
+```typescript
+// Launch async task
+delegate(prompt: "Research OAuth2 PKCE for SPAs...", agent: "explore")
 
-### Example
+// List all delegations (use sparingly)
+delegation_list()
 
-```
-You: Research the differences between Bun and Node.js performance
-
-Agent: I'll delegate this research task.
-[Uses delegate tool with agent: "general"]
-
-Agent: I've delegated the research. I'll continue with other work...
-
-[System notification: Delegation complete]
-
-Agent: The research is complete. Let me retrieve the results.
-[Uses delegation_read tool]
+// Read result by ID
+delegation_read("elegant-blue-tiger")
 ```
 
-## Available Agents
+## Source
 
-| Agent | Use Case |
-|-------|----------|
-| `general` | Multi-step tasks, complex research |
-| `explore` | Codebase exploration, file search |
-
-## Want More?
-
-For specialized agents (librarian, writer) and planning tools, check out the full [KDCO Workspace](https://github.com/kdcokenny/ocx).
+The implementation is in [`src/`](./src). It's TypeScript, fully readable, and designed to be forked and customized.
 
 ## License
 
