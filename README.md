@@ -1,6 +1,6 @@
 # opencode-background-agents
 
-> The ShadCN for AI coding agents. Async delegation that just works.
+> Async background agents for OpenCode. Delegate tasks, keep working, get notified when done.
 
 A plugin for [OpenCode](https://github.com/sst/opencode) that enables background task delegation using the "waiter model" - fire off tasks to specialist agents, continue working, and get notified when results are ready.
 
@@ -15,7 +15,7 @@ A plugin for [OpenCode](https://github.com/sst/opencode) that enables background
 
 ## Part of KDCO
 
-This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco) - a collection of AI agent components for OpenCode. It works great standalone, but for the full experience we recommend `kdco-workspace`, which bundles background agents with specialist agents, planning tools, and research protocols.
+This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco) - the ShadCN for OpenCode. It works great standalone, but for the full experience we recommend `kdco-workspace`, which bundles background agents with specialist agents, planning tools, and research protocols.
 
 ## Installation (Recommended)
 
