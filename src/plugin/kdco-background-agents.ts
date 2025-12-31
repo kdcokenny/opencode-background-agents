@@ -961,10 +961,8 @@ You have access to async delegation tools for parallel agent work.
 ### Agent Routing
 | Agent | Use For |
 |-------|---------|
-| \`kdco-librarian\` | External research (docs, APIs, best practices) - has MCP tools |
-| \`kdco-writer\` | Human-facing content (commits, docs, PRs) |
-| \`explore\` | Internal codebase (files, patterns, structure) |
-| \`general\` | Multi-step tasks, complex operations |
+| \`explore\` | Codebase exploration (files, patterns, structure) |
+| \`general\` | Research, multi-step tasks, complex operations |
 
 ### Async Behavior
 Delegations run in the background. When complete, you receive a \`<system-reminder>\` notification.
