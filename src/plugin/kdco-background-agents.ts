@@ -15,9 +15,9 @@ import * as crypto from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
-import { type Plugin, tool, type ToolContext } from "@opencode-ai/plugin"
-import type { Event, Message, Part, TextPart, createOpencodeClient } from "@opencode-ai/sdk"
-import { uniqueNamesGenerator, adjectives, colors, animals } from "unique-names-generator"
+import { type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
+import type { createOpencodeClient, Event, Message, Part, TextPart } from "@opencode-ai/sdk"
+import { adjectives, animals, colors, uniqueNamesGenerator } from "unique-names-generator"
 
 // ==========================================
 // READABLE ID GENERATION
