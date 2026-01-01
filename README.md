@@ -1,102 +1,93 @@
 # opencode-background-agents
 
-> Async background agents for OpenCode. Delegate tasks, keep working, get notified when done.
+> Keep working while research runs in the background. Your work survives context compaction.
 
-A plugin for [OpenCode](https://github.com/sst/opencode) that enables background task delegation using the "waiter model" - fire off tasks to specialist agents, continue working, and get notified when results are ready.
+A plugin for [OpenCode](https://github.com/sst/opencode) that enables async background delegation. Fire off research tasks, continue brainstorming or coding, and retrieve results when you need them.
 
-## What is this?
+## Why This Exists
 
-`opencode-background-agents` replaces the native `task` tool with a persistent, async-first delegation system:
+Context windows fill up. When that happens, compaction kicks in and your AI loses track of research it just did. You end up re-explaining, re-researching, starting over.
 
-- **Fire-and-forget** - Launch tasks and immediately continue working
-- **Waiter model** - You don't follow the waiter to the kitchen. Notifications arrive when ready.
-- **Persistent results** - Delegation outputs are saved and survive context compaction
-- **Human-readable IDs** - Results indexed by memorable names like `elegant-blue-tiger`
+Background agents solve this:
 
-## Part of KDCO
+- **Keep working** - Delegate research and continue your conversation. Brainstorm, code review, discuss architecture - you're not blocked waiting.
+- **Survive compaction** - Results are saved to disk as markdown. When context gets tight, the AI knows exactly where to retrieve past research.
+- **Fire and forget** - Use the "waiter model": you don't follow the waiter to the kitchen. A notification arrives when your order is ready.
 
-This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco), a collection of plugins, agents, and skills for OpenCode. It works great standalone, but for the full experience we recommend `kdco-workspace`, which bundles background agents with specialist agents, planning tools, and research protocols.
-
-## Installation (Recommended)
+## Installation
 
 Install via [OCX](https://github.com/kdcokenny/ocx), the package manager for OpenCode extensions:
 
 ```bash
 # Install OCX
 curl -fsSL https://ocx.kdco.dev/install.sh | sh
-# Or: npm install -g ocx
 
-# Initialize OCX in your project
+# Initialize and add the plugin
 ocx init
-
-# Add the KDCO registry
 ocx registry add --name kdco https://registry.kdco.dev
-
-# Install background agents
 ocx add kdco-background-agents
 ```
 
-Want the full workspace instead? It includes background agents plus specialist agents and protocols:
+Want the full experience? Install `kdco-workspace` instead - it bundles background agents with specialist agents, planning tools, and research protocols:
 
 ```bash
 ocx add kdco-workspace
 ```
 
-## Manual Installation
+## How It Works
 
-You can copy the source files directly into your `.opencode/` directory if you prefer not to use OCX.
+```
+1. Delegate    →  "Research OAuth2 PKCE best practices"
+2. Continue    →  Keep coding, brainstorming, reviewing
+3. Notified    →  <system-reminder> tells you it's done
+4. Retrieve    →  AI calls delegation_read() to get the result
+```
 
-**Caveats:**
-- You'll need to manually install dependencies (`unique-names-generator`)
-- Updates require manual re-copying
-- Dependency resolution is your responsibility
-
-The source is in [`src/`](./src) - copy the plugin file to `.opencode/plugin/kdco-background-agents.ts`.
-
-## Features
-
-### The Waiter Model
-
-Traditional task delegation blocks your workflow. Background agents work differently:
-
-1. **Order** - Request work with clear instructions
-2. **Trust** - The agent handles it while you continue working
-3. **Delivery** - A notification arrives with the complete result
-
-### Event-Driven Notifications
-
-No polling. When delegations complete, you receive a `<system-reminder>` with:
-- Human-readable ID
-- Auto-generated title and description
-- Status (complete, timeout, or error)
-
-### Persistent Results
-
-All delegation outputs are persisted to `~/.local/share/opencode/delegations/`. Results survive:
-- Context compaction
-- Session restarts
-- Process crashes
-
-Retrieve any result with `delegation_read("elegant-blue-tiger")`.
+Results are persisted to `~/.local/share/opencode/delegations/` as markdown files. Each delegation is automatically tagged with a title and summary, so the AI can scan past research and find what's relevant.
 
 ## Usage
 
 The plugin adds three tools:
 
-```typescript
-// Launch async task
-delegate(prompt: "Research OAuth2 PKCE for SPAs...", agent: "explore")
+| Tool | Purpose |
+|------|---------|
+| `delegate(prompt, agent)` | Launch a background task |
+| `delegation_read(id)` | Retrieve a specific result |
+| `delegation_list()` | List all delegations with titles and summaries |
 
-// List all delegations (use sparingly)
-delegation_list()
+## FAQ
 
-// Read result by ID
-delegation_read("elegant-blue-tiger")
-```
+### How does the AI know what each delegation contains?
 
-## Source
+Each delegation is automatically tagged with a title and summary when it completes. When the AI calls `delegation_list()`, it sees all past research with descriptions - not just opaque IDs. This lets it scan for relevant prior work and retrieve exactly what it needs.
 
-The implementation is in [`src/`](./src). It's TypeScript, fully readable, and designed to be forked and customized.
+### Does this persist after the session ends?
+
+Results are saved to disk and survive context compaction, session restarts, and process crashes. Within a session, the AI can retrieve any past delegation. New sessions start fresh but the files remain on disk.
+
+### Does this bloat my context?
+
+The opposite - it *saves* context. Heavy research runs in a separate sub-agent session. Only the distilled result comes back to your main conversation when you call `delegation_read()`.
+
+### How is this different from Claude Code's Task tool?
+
+Claude's native task tool runs sub-agents but results can be lost when context compacts. This plugin adds a persistence layer - results are written to markdown files, so the AI always knows where to find them.
+
+### Why install via OCX?
+
+One command, auto-configured, registry-backed updates. You could copy the files manually, but you'd need to handle dependencies (`unique-names-generator`) and updates yourself.
+
+## Manual Installation
+
+If you prefer not to use OCX, copy the source files from [`src/`](./src) to `.opencode/plugin/kdco-background-agents.ts`.
+
+**Caveats:**
+- Manually install dependencies (`unique-names-generator`)
+- Updates require manual re-copying
+
+## Part of the OCX Ecosystem
+
+This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco). For the full experience, check out [kdco-workspace](https://github.com/kdcokenny/ocx) which bundles background agents with specialist agents, planning tools, and notification support.
 
 ## License
 
