@@ -854,7 +854,7 @@ Use \`delegation_read\` with the ID to retrieve the full result.`,
 			agent: tool.schema
 				.string()
 				.describe(
-					'The agent type to use (e.g., "explore", "general", "kdco-librarian", "kdco-writer")',
+					'The agent to delegate to. Use agents available in your configuration (e.g., "explore", "general").',
 				),
 		},
 		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
@@ -936,40 +936,32 @@ Shows both running and completed delegations.`,
 // DELEGATION RULES (injected into system prompt)
 // ==========================================
 
-const DELEGATION_RULES = `
-## Delegation System
+const DELEGATION_RULES = `<system-reminder>
+<delegation-system>
 
-You have access to async delegation tools for parallel agent work.
+## Async Delegation
 
-### Available Tools
-- \`delegate(prompt, agent)\` - Launch async task, returns immediately with readable ID
-- \`delegation_read(id)\` - Retrieve completed delegation result
-- \`delegation_list()\` - List all delegations (use sparingly)
+You have tools for parallel background work:
+- \`delegate(prompt, agent)\` - Launch task, returns ID immediately
+- \`delegation_read(id)\` - Retrieve completed result
+- \`delegation_list()\` - List delegations (use sparingly)
 
-### Agent Routing
-| Agent | Use For |
-|-------|---------|
-| \`explore\` | Codebase exploration (files, patterns, structure) |
-| \`general\` | Research, multi-step tasks, complex operations |
+## How It Works
 
-### Async Behavior
-Delegations run in the background. When complete, you receive a \`<system-reminder>\` notification.
+1. Call \`delegate\` with a detailed prompt and agent name
+2. Continue productive work while it runs
+3. Receive \`<system-reminder>\` notification when ALL complete
+4. Call \`delegation_read(id)\` to retrieve results
 
-**Flow:**
-1. Launch delegations with \`delegate\` (can launch multiple in one message)
-2. Continue productive work while they run
-3. Receive \`<system-reminder>\` when ALL complete
-4. Call \`delegation_read(id)\` to retrieve each result
+## Critical Constraints
 
-### Critical Constraints
-
-**NEVER poll \`delegation_list\` to check if delegations are complete.**
-- You WILL be notified via \`<system-reminder>\` when ALL delegations complete
-- Polling wastes tokens and cannot speed up completion
-- If delegations are running, continue with other productive work
+**NEVER poll \`delegation_list\` to check completion.**
+You WILL be notified via \`<system-reminder>\`. Polling wastes tokens.
 
 **NEVER wait idle.** Always have productive work while delegations run.
-`
+
+</delegation-system>
+</system-reminder>`
 
 // ==========================================
 // PLUGIN EXPORT
