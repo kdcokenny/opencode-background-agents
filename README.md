@@ -25,13 +25,13 @@ curl -fsSL https://ocx.kdco.dev/install.sh | sh
 # Initialize and add the plugin
 ocx init
 ocx registry add --name kdco https://registry.kdco.dev
-ocx add kdco-background-agents
+ocx add kdco/background-agents
 ```
 
 Want the full experience? Install `kdco-workspace` instead - it bundles background agents with specialist agents, planning tools, and research protocols:
 
 ```bash
-ocx add kdco-workspace
+ocx add kdco/workspace
 ```
 
 ## How It Works
@@ -79,7 +79,7 @@ One command, auto-configured, registry-backed updates. You could copy the files 
 
 ## Manual Installation
 
-If you prefer not to use OCX, copy the source files from [`src/`](./src) to `.opencode/plugin/kdco-background-agents.ts`.
+If you prefer not to use OCX, copy the source files from [`src/`](./src) to `.opencode/plugin/background-agents.ts`.
 
 **Caveats:**
 - Manually install dependencies (`unique-names-generator`)
