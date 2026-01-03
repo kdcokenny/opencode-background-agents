@@ -279,12 +279,20 @@ class DelegationManager {
 			throw new Error("Failed to generate unique delegation ID after 10 attempts")
 		}
 
-		// Create isolated session for delegation with agent binding
+		// Create isolated session for delegation
+		// Anti-recursion: use permissions to disable nested delegations and state-modifying tools
 		const sessionResult = await this.client.session.create({
 			body: {
-				agent: input.agent, // Bind agent at creation (required for agent loop initialization)
 				title: `Delegation: ${finalId}`,
 				parentID: input.parentSessionID,
+				permission: [
+					{ permission: "task", pattern: "*", action: "deny" },
+					{ permission: "delegate", pattern: "*", action: "deny" },
+					{ permission: "todowrite", pattern: "*", action: "deny" },
+					{ permission: "todoread", pattern: "*", action: "deny" },
+					{ permission: "plan_save", pattern: "*", action: "deny" },
+					{ permission: "plan_read", pattern: "*", action: "deny" },
+				],
 			},
 		})
 
@@ -339,16 +347,12 @@ class DelegationManager {
 		await this.ensureDelegationsDir(input.parentSessionID)
 
 		// Fire the prompt (using prompt() instead of promptAsync() to properly initialize agent loop)
+		// Agent param is critical for MCP tools - tells OpenCode which agent's config to use
 		this.client.session
 			.prompt({
 				path: { id: delegation.sessionID },
 				body: {
-					// Agent already bound at session creation
-					// Anti-recursion: disable nested delegations
-					tools: {
-						task: false,
-						delegate: false,
-					},
+					agent: input.agent,
 					parts: [{ type: "text", text: input.prompt }],
 				},
 			})
