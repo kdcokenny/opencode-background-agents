@@ -279,6 +279,26 @@ class DelegationManager {
 			throw new Error("Failed to generate unique delegation ID after 10 attempts")
 		}
 
+		// Validate agent exists before creating session
+		const agentsResult = await this.client.app.agents({})
+		const agents = (agentsResult.data ?? []) as {
+			name: string
+			description?: string
+			mode?: string
+		}[]
+		const validAgent = agents.find((a) => a.name === input.agent)
+
+		if (!validAgent) {
+			const available = agents
+				.filter((a) => a.mode === "subagent" || a.mode === "all" || !a.mode)
+				.map((a) => `• ${a.name}${a.description ? ` - ${a.description}` : ""}`)
+				.join("\n")
+
+			throw new Error(
+				`Agent "${input.agent}" not found.\n\nAvailable agents:\n${available || "(none)"}`,
+			)
+		}
+
 		// Create isolated session for delegation
 		// Anti-recursion: use permissions to disable nested delegations and state-modifying tools
 		const sessionResult = await this.client.session.create({
@@ -664,7 +684,9 @@ Use \`delegation_read("${delegation.id}")\` to retrieve this result when ready.
 			}
 		}
 
-		throw new Error(`Delegation not found: ${id}`)
+		throw new Error(
+			`Delegation "${id}" not found.\n\nUse delegation_list() to see available delegations.`,
+		)
 	}
 
 	/**
@@ -863,7 +885,7 @@ Use \`delegation_read\` with the ID to retrieve the full result.`,
 			agent: tool.schema
 				.string()
 				.describe(
-					'The agent to delegate to. Use agents available in your configuration (e.g., "explore", "general").',
+					'Agent to delegate to: "explore" (codebase search), "librarian" (external research), "writer" (docs/commits), or "general".',
 				),
 		},
 		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
@@ -874,25 +896,30 @@ Use \`delegation_read\` with the ID to retrieve the full result.`,
 				throw new Error("delegate requires messageID")
 			}
 
-			const delegation = await manager.delegate({
-				parentSessionID: toolCtx.sessionID,
-				parentMessageID: toolCtx.messageID,
-				parentAgent: toolCtx.agent,
-				prompt: args.prompt,
-				agent: args.agent,
-			})
+			try {
+				const delegation = await manager.delegate({
+					parentSessionID: toolCtx.sessionID,
+					parentMessageID: toolCtx.messageID,
+					parentAgent: toolCtx.agent,
+					prompt: args.prompt,
+					agent: args.agent,
+				})
 
-			// Get total active count for this parent session
-			const pendingSet = manager.getPendingCount(toolCtx.sessionID)
-			const totalActive = pendingSet
+				// Get total active count for this parent session
+				const pendingSet = manager.getPendingCount(toolCtx.sessionID)
+				const totalActive = pendingSet
 
-			let response = `Delegation started: ${delegation.id}\nAgent: ${args.agent}`
-			if (totalActive > 1) {
-				response += `\n\n${totalActive} delegations now active.`
+				let response = `Delegation started: ${delegation.id}\nAgent: ${args.agent}`
+				if (totalActive > 1) {
+					response += `\n\n${totalActive} delegations now active.`
+				}
+				response += `\nYou WILL be notified when ${totalActive > 1 ? "ALL complete" : "complete"}. Do NOT poll.`
+
+				return response
+			} catch (error) {
+				// Return validation errors as guidance, not exceptions
+				return `❌ Delegation failed:\n\n${error instanceof Error ? error.message : "Unknown error"}`
 			}
-			response += `\nYou WILL be notified when ${totalActive > 1 ? "ALL complete" : "complete"}. Do NOT poll.`
-
-			return response
 		},
 	})
 }
