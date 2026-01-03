@@ -181,7 +181,6 @@ interface Delegation {
 	completedAt?: Date
 	progress: DelegationProgress
 	error?: string
-	parentModel?: { providerID: string; modelID: string }
 	// Generated on completion by small_model
 	title?: string
 	description?: string
@@ -193,7 +192,6 @@ interface DelegateInput {
 	parentAgent: string
 	prompt: string
 	agent: string
-	parentModel?: { providerID: string; modelID: string }
 }
 
 interface DelegationListItem {
@@ -201,6 +199,7 @@ interface DelegationListItem {
 	status: string
 	title?: string
 	description?: string
+	agent?: string
 }
 
 // ==========================================
@@ -222,7 +221,7 @@ class DelegationManager {
 	/**
 	 * Resolves the root session ID by walking up the parent chain.
 	 */
-	private async getRootSessionID(sessionID: string): Promise<string> {
+	async getRootSessionID(sessionID: string): Promise<string> {
 		let currentID = sessionID
 		// Prevent infinite loops with max depth
 		for (let depth = 0; depth < 10; depth++) {
@@ -280,9 +279,10 @@ class DelegationManager {
 			throw new Error("Failed to generate unique delegation ID after 10 attempts")
 		}
 
-		// Create isolated session for delegation
+		// Create isolated session for delegation with agent binding
 		const sessionResult = await this.client.session.create({
 			body: {
+				agent: input.agent, // Bind agent at creation (required for agent loop initialization)
 				title: `Delegation: ${finalId}`,
 				parentID: input.parentSessionID,
 			},
@@ -308,7 +308,6 @@ class DelegationManager {
 				toolCalls: 0,
 				lastUpdate: new Date(),
 			},
-			parentModel: input.parentModel,
 		}
 
 		await this.debugLog(`Created delegation ${delegation.id}`)
@@ -339,13 +338,12 @@ class DelegationManager {
 		// Ensure delegations directory exists (early check)
 		await this.ensureDelegationsDir(input.parentSessionID)
 
-		// Fire the prompt asynchronously
+		// Fire the prompt (using prompt() instead of promptAsync() to properly initialize agent loop)
 		this.client.session
-			.promptAsync({
+			.prompt({
 				path: { id: delegation.sessionID },
 				body: {
-					agent: input.agent,
-					model: input.parentModel,
+					// Agent already bound at session creation
 					// Anti-recursion: disable nested delegations
 					tools: {
 						task: false,
@@ -691,14 +689,17 @@ Use \`delegation_read("${delegation.id}")\` to retrieve this result when ready.
 					const id = file.replace(".md", "")
 					// Deduplicate: prioritize in-memory status
 					if (!results.find((r) => r.id === id)) {
-						// Try to read title from file
+						// Try to read title, agent, description from file
 						let title = "(loaded from storage)"
 						let description = ""
+						let agent: string | undefined
 						try {
 							const filePath = path.join(dir, file)
 							const content = await fs.readFile(filePath, "utf8")
 							const titleMatch = content.match(/^# (.+)$/m)
 							if (titleMatch) title = titleMatch[1]
+							const agentMatch = content.match(/^\*\*Agent:\*\* (.+)$/m)
+							if (agentMatch) agent = agentMatch[1]
 							// Get first paragraph after title as description
 							const lines = content.split("\n")
 							if (lines.length > 2 && lines[2]) {
@@ -712,6 +713,7 @@ Use \`delegation_read("${delegation.id}")\` to retrieve this result when ready.
 							status: "complete",
 							title,
 							description,
+							agent,
 						})
 					}
 				}
@@ -791,6 +793,24 @@ Use \`delegation_read("${delegation.id}")\` to retrieve this result when ready.
 	getPendingCount(parentSessionID: string): number {
 		const pendingSet = this.pendingByParent.get(parentSessionID)
 		return pendingSet ? pendingSet.size : 0
+	}
+
+	/**
+	 * Get all currently running delegations (in-memory only)
+	 */
+	getRunningDelegations(): Delegation[] {
+		return Array.from(this.delegations.values()).filter((d) => d.status === "running")
+	}
+
+	/**
+	 * Get recent completed delegations for compaction injection
+	 */
+	async getRecentCompletedDelegations(
+		sessionID: string,
+		limit: number = 10,
+	): Promise<DelegationListItem[]> {
+		const all = await this.listDelegations(sessionID)
+		return all.filter((d) => d.status !== "running").slice(-limit)
 	}
 
 	/**
@@ -949,6 +969,85 @@ You WILL be notified via \`<system-reminder>\`. Polling wastes tokens.
 </system-reminder>`
 
 // ==========================================
+// COMPACTION CONTEXT FORMATTING
+// ==========================================
+
+interface DelegationForContext {
+	id: string
+	agent?: string
+	title?: string
+	description?: string
+	status: string
+	startedAt?: Date
+	prompt?: string
+}
+
+/**
+ * Format delegation context for injection during compaction.
+ * Includes running delegations with notification reminder (only when running exist),
+ * and recent completed delegations with full descriptions.
+ */
+function formatDelegationContext(
+	running: DelegationForContext[],
+	completed: DelegationForContext[],
+): string {
+	const sections: string[] = ["<delegation-context>"]
+
+	// Running delegations (if any)
+	if (running.length > 0) {
+		sections.push("## Running Delegations")
+		sections.push("")
+		for (const d of running) {
+			sections.push(`### \`${d.id}\`${d.agent ? ` (${d.agent})` : ""}`)
+			if (d.startedAt) {
+				sections.push(`**Started:** ${d.startedAt.toISOString()}`)
+			}
+			if (d.prompt) {
+				const truncatedPrompt = d.prompt.length > 200 ? `${d.prompt.slice(0, 200)}...` : d.prompt
+				sections.push(`**Prompt:** ${truncatedPrompt}`)
+			}
+			sections.push("")
+		}
+
+		// Only include reminder when there ARE running delegations
+		sections.push(
+			"> **Note:** You WILL be notified via `<system-reminder>` when delegations complete.",
+		)
+		sections.push("> Do NOT poll `delegation_list` - continue productive work.")
+		sections.push("")
+	}
+
+	// Completed delegations (recent)
+	if (completed.length > 0) {
+		sections.push("## Recent Completed Delegations")
+		sections.push("")
+		for (const d of completed) {
+			const statusEmoji =
+				d.status === "complete"
+					? "✅"
+					: d.status === "error"
+						? "❌"
+						: d.status === "timeout"
+							? "⏱️"
+							: "🚫"
+			sections.push(`### ${statusEmoji} \`${d.id}\``)
+			sections.push(`**Title:** ${d.title || "(no title)"}`)
+			sections.push(`**Status:** ${d.status}`)
+			sections.push(`**Description:** ${d.description || "(no description)"}`)
+			sections.push("")
+		}
+		sections.push("> Use `delegation_list()` to see all delegations for this session.")
+		sections.push("")
+	}
+
+	sections.push("## Retrieval")
+	sections.push('Use `delegation_read("id")` to access full delegation output.')
+	sections.push("</delegation-context>")
+
+	return sections.join("\n")
+}
+
+// ==========================================
 // PLUGIN EXPORT
 // ==========================================
 
@@ -986,6 +1085,46 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 		// Inject delegation rules into system prompt
 		"experimental.chat.system.transform": async (_input: SystemTransformInput, output) => {
 			output.system.push(DELEGATION_RULES)
+		},
+
+		// Compaction hook - inject delegation context for context recovery
+		"experimental.session.compacting": async (
+			input: { sessionID: string },
+			output: { context: string[]; prompt?: string },
+		) => {
+			const rootSessionID = await manager.getRootSessionID(input.sessionID)
+
+			// Get running delegations for this session tree
+			const running = manager
+				.getRunningDelegations()
+				.filter((d) => d.parentSessionID === input.sessionID || d.parentSessionID === rootSessionID)
+				.map((d) => ({
+					id: d.id,
+					agent: d.agent,
+					title: d.title,
+					description: d.description,
+					status: d.status,
+					startedAt: d.startedAt,
+					prompt: d.prompt,
+				}))
+
+			// Get recent completed delegations (last 10)
+			const allDelegations = await manager.listDelegations(input.sessionID)
+			const completed = allDelegations
+				.filter((d) => d.status !== "running")
+				.slice(-10)
+				.map((d) => ({
+					id: d.id,
+					agent: d.agent,
+					title: d.title,
+					description: d.description,
+					status: d.status,
+				}))
+
+			// Early exit if nothing to inject
+			if (running.length === 0 && completed.length === 0) return
+
+			output.context.push(formatDelegationContext(running, completed))
 		},
 
 		// Event hook
