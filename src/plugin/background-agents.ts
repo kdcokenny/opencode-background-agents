@@ -1,5 +1,5 @@
 /**
- * kdco-background-agents
+ * background-agents
  * Unified delegation system for OpenCode
  *
  * Replaces native `task` tool with persistent, async-first agent delegation.
@@ -213,8 +213,6 @@ class DelegationManager {
 	private baseDir: string
 	// Track pending delegations per parent session for batched notifications
 	private pendingByParent: Map<string, Set<string>> = new Map()
-	// Track completed delegations waiting to be batched
-	private completedBatch: Map<string, Delegation[]> = new Map()
 
 	constructor(client: OpencodeClient, baseDir: string) {
 		this.client = client
@@ -261,15 +259,6 @@ class DelegationManager {
 		const dir = await this.getDelegationsDir(sessionID)
 		await fs.mkdir(dir, { recursive: true })
 		return dir
-	}
-
-	/**
-	 * Generate a unique delegation ID
-	 */
-	private generateId(): string {
-		const timestamp = Date.now().toString(36)
-		const random = Math.random().toString(36).substring(2, 8)
-		return `dlg_${timestamp}_${random}`
 	}
 
 	/**
@@ -330,9 +319,9 @@ class DelegationManager {
 		if (!this.pendingByParent.has(parentId)) {
 			this.pendingByParent.set(parentId, new Set())
 		}
-		this.pendingByParent.get(parentId)!.add(delegation.id)
+		this.pendingByParent.get(parentId)?.add(delegation.id)
 		await this.debugLog(
-			`Tracking delegation ${delegation.id} for parent ${parentId}. Pending count: ${this.pendingByParent.get(parentId)!.size}`,
+			`Tracking delegation ${delegation.id} for parent ${parentId}. Pending count: ${this.pendingByParent.get(parentId)?.size}`,
 		)
 
 		await this.debugLog(
@@ -400,7 +389,7 @@ class DelegationManager {
 
 		// Get whatever result was produced so far
 		const result = await this.getResult(delegation)
-		await this.persistOutput(delegation, result + "\n\n[TIMEOUT REACHED]")
+		await this.persistOutput(delegation, `${result}\n\n[TIMEOUT REACHED]`)
 
 		// Notify parent session
 		await this.notifyParent(delegation)
@@ -832,10 +821,6 @@ interface DelegateArgs {
 	agent: string
 }
 
-interface DelegationReadArgs {
-	id: string
-}
-
 function createDelegate(manager: DelegationManager): ReturnType<typeof tool> {
 	return tool({
 		description: `Delegate a task to an agent. Returns immediately with a readable ID.
@@ -979,7 +964,7 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 	const { client, directory } = ctx
 
 	// Project-level storage directory (shared across sessions)
-	// Matches logic in kdco-workspace-plugin.ts
+	// Matches logic in workspace-plugin.ts
 	const realDir = await fs.realpath(directory)
 	const normalizedDir = realDir.endsWith(path.sep) ? realDir.slice(0, -1) : realDir
 	const projectHash = crypto.createHash("sha256").update(normalizedDir).digest("hex").slice(0, 40)
@@ -993,10 +978,6 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 	await manager.debugLog("BackgroundAgentsPlugin initialized with delegation system")
 
 	return {
-		// Disable native task tool - delegate replaces it
-		tools: {
-			task: false,
-		},
 		tool: {
 			delegate: createDelegate(manager),
 			delegation_read: createDelegationRead(manager),
