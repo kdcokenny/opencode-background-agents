@@ -203,6 +203,35 @@ interface DelegationListItem {
 }
 
 // ==========================================
+// AGENT CAPABILITY DETECTION
+// ==========================================
+
+/**
+ * Check if an agent is read-only based on its tool permissions.
+ * Read-only = edit, write, AND bash are ALL explicitly false.
+ *
+ * Following our philosophy:
+ * - Parse Don't Validate: Parse config once, return boolean
+ * - Atomic Predictability: Same input = same output
+ */
+async function isReadOnlyAgent(client: OpencodeClient, agentName: string): Promise<boolean> {
+	try {
+		const config = await client.config.get()
+		const configData = config.data as {
+			agent?: Record<string, { tools?: Record<string, boolean> }>
+		}
+
+		const agentTools = configData?.agent?.[agentName]?.tools ?? {}
+
+		// Only read-only if ALL THREE are explicitly false
+		return agentTools.edit === false && agentTools.write === false && agentTools.bash === false
+	} catch {
+		// On error, assume write-capable (safer default)
+		return false
+	}
+}
+
+// ==========================================
 // DELEGATION MANAGER
 // ==========================================
 
@@ -296,6 +325,17 @@ class DelegationManager {
 
 			throw new Error(
 				`Agent "${input.agent}" not found.\n\nAvailable agents:\n${available || "(none)"}`,
+			)
+		}
+
+		// Check if agent is read-only (Early Exit + Fail Fast)
+		const readOnly = await isReadOnlyAgent(this.client, input.agent)
+		if (!readOnly) {
+			throw new Error(
+				`Agent "${input.agent}" is write-capable and requires the native \`task\` tool for proper undo/branching support.\n\n` +
+					`Use \`task\` instead of \`delegate\` for write-capable agents.\n\n` +
+					`Read-only agents (researcher, explore) use \`delegate\`.\n` +
+					`Write-capable agents (coder, scribe) use \`task\`.`,
 			)
 		}
 
@@ -982,12 +1022,25 @@ You have tools for parallel background work:
 - \`delegation_read(id)\` - Retrieve completed result
 - \`delegation_list()\` - List delegations (use sparingly)
 
+## Delegation Routing
+
+Agents route based on their permissions:
+
+| Agent Type | Tool | Why |
+|------------|------|-----|
+| Read-only (researcher, explore) | \`delegate\` | Background session, async |
+| Write-capable (coder, scribe) | \`task\` | Native task, preserves undo/branching |
+
+**Read-only agents** have edit=false, write=false, bash=false.
+**Write-capable agents** have any write tool enabled.
+
 ## How It Works
 
-1. Call \`delegate\` with a detailed prompt and agent name
-2. Continue productive work while it runs
-3. Receive \`<system-reminder>\` notification when ALL complete
-4. Call \`delegation_read(id)\` to retrieve results
+1. For read-only agents: Call \`delegate\` with detailed prompt
+2. For write-capable agents: Call \`task\` with detailed prompt
+3. Continue productive work while it runs
+4. Receive notification when complete
+5. Call \`delegation_read(id)\` to retrieve results
 
 ## Critical Constraints
 
@@ -995,6 +1048,8 @@ You have tools for parallel background work:
 You WILL be notified via \`<system-reminder>\`. Polling wastes tokens.
 
 **NEVER wait idle.** Always have productive work while delegations run.
+
+**Using wrong tool will fail fast with guidance.**
 
 </delegation-system>
 </system-reminder>`
@@ -1113,6 +1168,31 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			delegation_read: createDelegationRead(manager),
 			delegation_list: createDelegationList(manager),
 		},
+
+		// Prevent read-only agents from using native task tool (symmetric to delegate enforcement)
+		"tool.execute.before": async (
+			input: { tool: string },
+			output: { args?: { subagent_type?: string } },
+		) => {
+			// Only intercept task tool
+			if (input.tool !== "task") return
+
+			// Extract agent name - task tool uses "subagent_type" parameter
+			const agentName = output.args?.subagent_type
+			if (!agentName) return
+
+			// Check if this agent is read-only
+			const readOnly = await isReadOnlyAgent(client as OpencodeClient, agentName)
+			if (readOnly) {
+				throw new Error(
+					`❌ Agent '${agentName}' is read-only and should use the delegate tool for async background execution.\n\n` +
+						`Read-only agents have: edit=false, write=false, bash=false\n` +
+						`Use delegate for: researcher, explore\n` +
+						`Use task for: coder, scribe`,
+				)
+			}
+		},
+
 		// Inject delegation rules into system prompt
 		"experimental.chat.system.transform": async (_input: SystemTransformInput, output) => {
 			output.system.push(DELEGATION_RULES)
