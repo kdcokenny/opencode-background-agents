@@ -885,7 +885,7 @@ Use \`delegation_read\` with the ID to retrieve the full result.`,
 			agent: tool.schema
 				.string()
 				.describe(
-					'Agent to delegate to: "explore" (codebase search), "librarian" (external research), "writer" (docs/commits), or "general".',
+					'Agent to delegate to: \"explore\" (codebase search), \"researcher\" (external research), \"scribe\" (docs/commits), or \"general\".',
 				),
 		},
 		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
