@@ -930,10 +930,10 @@ Use \`delegation_read\` with the ID to retrieve the full result.`,
 		},
 		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
 			if (!toolCtx?.sessionID) {
-				throw new Error("delegate requires sessionID")
+				return "❌ delegate requires sessionID. This is a system error."
 			}
 			if (!toolCtx?.messageID) {
-				throw new Error("delegate requires messageID")
+				return "❌ delegate requires messageID. This is a system error."
 			}
 
 			try {
@@ -973,7 +973,7 @@ Use this to retrieve results from delegated tasks.`,
 		},
 		async execute(args: { id: string }, toolCtx: ToolContext): Promise<string> {
 			if (!toolCtx?.sessionID) {
-				throw new Error("delegation_read requires sessionID")
+				return "❌ delegation_read requires sessionID. This is a system error."
 			}
 
 			return await manager.readOutput(toolCtx.sessionID, args.id)
@@ -988,7 +988,7 @@ Shows both running and completed delegations.`,
 		args: {},
 		async execute(_args: Record<string, never>, toolCtx: ToolContext): Promise<string> {
 			if (!toolCtx?.sessionID) {
-				throw new Error("delegation_list requires sessionID")
+				return "❌ delegation_list requires sessionID. This is a system error."
 			}
 
 			const delegations = await manager.listDelegations(toolCtx.sessionID)
