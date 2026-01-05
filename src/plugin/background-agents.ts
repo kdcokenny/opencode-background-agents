@@ -241,12 +241,22 @@ async function parseAgentWriteCapability(
 	try {
 		const config = await client.config.get()
 		const configData = config.data as {
-			agent?: Record<string, { tools?: Record<string, boolean> }>
+			agent?: Record<
+				string,
+				{
+					permission?: Record<string, string | Record<string, string>>
+				}
+			>
 		}
-		const tools = configData?.agent?.[agentName]?.tools ?? {}
-		return {
-			isReadOnly: tools.edit === false && tools.write === false && tools.bash === false,
-		}
+		const permission = configData?.agent?.[agentName]?.permission ?? {}
+
+		const editDenied = permission.edit === "deny"
+		const writeDenied = permission.write === "deny"
+		const bashDenied =
+			permission.bash === "deny" ||
+			(typeof permission.bash === "object" && permission.bash["*"] === "deny")
+
+		return { isReadOnly: editDenied && writeDenied && bashDenied }
 	} catch (error) {
 		// Fail-safe: Config errors shouldn't block task calls
 		// Fail-loud: Log for observability
@@ -1057,7 +1067,7 @@ Agents route based on their permissions:
 | Read-only (researcher, explore) | \`delegate\` | Background session, async |
 | Write-capable (coder, scribe) | \`task\` | Native task, preserves undo/branching |
 
-**Read-only agents** have edit=false, write=false, bash=false.
+**Read-only agents** have edit="deny", write="deny", bash={"*":"deny"}.
 **Write-capable agents** have any write tool enabled.
 
 ## How It Works
@@ -1222,7 +1232,7 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			// Fail fast: Read-only sub-agent via task is invalid
 			throw new Error(
 				`❌ Agent '${agentName}' is read-only and should use the delegate tool for async background execution.\n\n` +
-					`Read-only agents have: edit=false, write=false, bash=false\n` +
+					`Read-only agents have: edit="deny", write="deny", bash={"*":"deny"}\n` +
 					`Use delegate for: researcher, explore\n` +
 					`Use task for: coder, scribe`,
 			)
