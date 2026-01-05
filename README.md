@@ -55,6 +55,30 @@ The plugin adds three tools:
 | `delegation_read(id)` | Retrieve a specific result |
 | `delegation_list()` | List all delegations with titles and summaries |
 
+## Limitations
+
+### Read-Only Agents Only
+
+Only read-only agents (`researcher`, `explore`) can use `delegate`. Write-capable agents (`coder`, `scribe`) must use the native `task` tool.
+
+**Why?** Background delegations run in isolated sessions outside OpenCode's session tree. The undo/branching system cannot track changes made in background sessions—reverting would not affect these changes, risking unexpected data loss.
+
+> A workaround is being explored.
+
+### Timeout
+
+Delegations timeout after **15 minutes**.
+
+### Real-Time Monitoring
+
+View active and completed sub-agents using OpenCode's navigation shortcuts:
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+X Up` | Jump to parent session |
+| `Ctrl+X Left` | Previous sub-agent |
+| `Ctrl+X Right` | Next sub-agent |
+
 ## FAQ
 
 ### How does the AI know what each delegation contains?
