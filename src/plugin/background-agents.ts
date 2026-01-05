@@ -231,8 +231,28 @@ async function parseAgentMode(
 }
 
 /**
+ * Permission entry type: simple value or pattern object.
+ * Matches CLI schema: z.union([z.enum(["ask", "allow", "deny"]), z.record(z.enum(...))])
+ */
+type PermissionEntry = "ask" | "allow" | "deny" | Record<string, "ask" | "allow" | "deny">
+
+/**
+ * Check if a permission entry denies access (Law 4: Fail Fast).
+ * Handles both simple values ("deny") and pattern objects ({ "*": "deny" }).
+ */
+function isPermissionDenied(entry: PermissionEntry | undefined): boolean {
+	if (entry === undefined) return false
+	if (entry === "deny") return true
+	if (typeof entry === "object" && entry["*"] === "deny") return true
+	return false
+}
+
+/**
  * Parse agent write capability at boundary.
  * Returns trusted type indicating if agent is read-only.
+ *
+ * An agent is read-only when ALL of: edit, write, and bash are denied.
+ * Permission schema supports both simple ("deny") and pattern ({ "*": "deny" }) values.
  */
 async function parseAgentWriteCapability(
 	client: OpencodeClient,
@@ -244,17 +264,15 @@ async function parseAgentWriteCapability(
 			agent?: Record<
 				string,
 				{
-					permission?: Record<string, string | Record<string, string>>
+					permission?: Record<string, PermissionEntry>
 				}
 			>
 		}
 		const permission = configData?.agent?.[agentName]?.permission ?? {}
 
-		const editDenied = permission.edit === "deny"
-		const writeDenied = permission.write === "deny"
-		const bashDenied =
-			permission.bash === "deny" ||
-			(typeof permission.bash === "object" && permission.bash["*"] === "deny")
+		const editDenied = isPermissionDenied(permission.edit)
+		const writeDenied = isPermissionDenied(permission.write)
+		const bashDenied = isPermissionDenied(permission.bash)
 
 		return { isReadOnly: editDenied && writeDenied && bashDenied }
 	} catch (error) {
