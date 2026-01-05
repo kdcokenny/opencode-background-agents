@@ -166,7 +166,7 @@ interface DelegationProgress {
 	lastMessageAt?: Date
 }
 
-const MAX_RUN_TIME_MS = 5 * 60 * 1000 // 5 minutes
+const MAX_RUN_TIME_MS = 15 * 60 * 1000 // 15 minutes
 
 interface Delegation {
 	id: string // Human-readable ID (e.g., "swift-amber-falcon")
