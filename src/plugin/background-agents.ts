@@ -207,34 +207,60 @@ interface DelegationListItem {
 // ==========================================
 
 /**
- * Check if an agent is read-only based on its tool permissions.
- * Read-only = edit, write, AND bash are ALL explicitly false.
- *
- * Following our philosophy:
- * - Parse Don't Validate: Parse config once, return boolean
- * - Atomic Predictability: Same input = same output
+ * Parse agent mode at boundary.
+ * Returns trusted type indicating if agent is a sub-agent.
  */
-async function isReadOnlyAgent(client: OpencodeClient, agentName: string): Promise<boolean> {
+async function parseAgentMode(
+	client: OpencodeClient,
+	agentName: string,
+): Promise<{ isSubAgent: boolean }> {
+	try {
+		const result = await client.app.agents({})
+		const agents = (result.data ?? []) as { name: string; mode?: string }[]
+		const agent = agents.find((a) => a.name === agentName)
+		return { isSubAgent: agent?.mode === "subagent" }
+	} catch (error) {
+		// Fail-safe: Agent list errors shouldn't block task calls
+		// Fail-loud: Log for observability
+		console.warn(
+			`[background-agents] Agent list fetch failed for "${agentName}", assuming non-sub-agent:`,
+			error,
+		)
+		return { isSubAgent: false }
+	}
+}
+
+/**
+ * Parse agent write capability at boundary.
+ * Returns trusted type indicating if agent is read-only.
+ */
+async function parseAgentWriteCapability(
+	client: OpencodeClient,
+	agentName: string,
+): Promise<{ isReadOnly: boolean }> {
 	try {
 		const config = await client.config.get()
 		const configData = config.data as {
 			agent?: Record<string, { tools?: Record<string, boolean> }>
 		}
-
-		const agentTools = configData?.agent?.[agentName]?.tools ?? {}
-
-		// Only read-only if ALL THREE are explicitly false
-		return agentTools.edit === false && agentTools.write === false && agentTools.bash === false
-	} catch {
-		// On error, assume write-capable (safer default)
-		return false
+		const tools = configData?.agent?.[agentName]?.tools ?? {}
+		return {
+			isReadOnly: tools.edit === false && tools.write === false && tools.bash === false,
+		}
+	} catch (error) {
+		// Fail-safe: Config errors shouldn't block task calls
+		// Fail-loud: Log for observability
+		console.warn(
+			`[background-agents] Config fetch failed for "${agentName}", assuming write-capable:`,
+			error,
+		)
+		return { isReadOnly: false }
 	}
 }
 
-// ==========================================
-// DELEGATION MANAGER
-// ==========================================
-
+/**
+ * DELEGATION MANAGER
+ */
 class DelegationManager {
 	private delegations: Map<string, Delegation> = new Map()
 	private client: OpencodeClient
@@ -329,8 +355,8 @@ class DelegationManager {
 		}
 
 		// Check if agent is read-only (Early Exit + Fail Fast)
-		const readOnly = await isReadOnlyAgent(this.client, input.agent)
-		if (!readOnly) {
+		const { isReadOnly } = await parseAgentWriteCapability(this.client, input.agent)
+		if (!isReadOnly) {
 			throw new Error(
 				`Agent "${input.agent}" is write-capable and requires the native \`task\` tool for proper undo/branching support.\n\n` +
 					`Use \`task\` instead of \`delegate\` for write-capable agents.\n\n` +
@@ -1174,30 +1200,32 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			input: { tool: string },
 			output: { args?: { subagent_type?: string } },
 		) => {
-			// Only intercept task tool
+			// Guard: Only intercept task tool
 			if (input.tool !== "task") return
 
-			// Extract agent name - task tool uses "subagent_type" parameter
+			// Guard: Require agent name
 			const agentName = output.args?.subagent_type
 			if (!agentName) return
 
-			// Guard: Only validate explicitly defined sub-agents
-			const agentsResult = await (client as OpencodeClient).app.agents({})
-			const agents = (agentsResult.data ?? []) as { name: string; mode?: string }[]
-			const agent = agents.find((a) => a.name === agentName)
+			// Parse boundary 1: Check agent mode
+			const { isSubAgent } = await parseAgentMode(client as OpencodeClient, agentName)
 
-			if (!agent || agent.mode !== "subagent") return // Skip main/built-in agents
+			// Guard: Allow non-sub-agents (main/built-in)
+			if (!isSubAgent) return
 
-			// Check if this agent is read-only
-			const readOnly = await isReadOnlyAgent(client as OpencodeClient, agentName)
-			if (readOnly) {
-				throw new Error(
-					`❌ Agent '${agentName}' is read-only and should use the delegate tool for async background execution.\n\n` +
-						`Read-only agents have: edit=false, write=false, bash=false\n` +
-						`Use delegate for: researcher, explore\n` +
-						`Use task for: coder, scribe`,
-				)
-			}
+			// Parse boundary 2: Check write capability (only for sub-agents)
+			const { isReadOnly } = await parseAgentWriteCapability(client as OpencodeClient, agentName)
+
+			// Guard: Allow write-capable agents
+			if (!isReadOnly) return
+
+			// Fail fast: Read-only sub-agent via task is invalid
+			throw new Error(
+				`❌ Agent '${agentName}' is read-only and should use the delegate tool for async background execution.\n\n` +
+					`Read-only agents have: edit=false, write=false, bash=false\n` +
+					`Use delegate for: researcher, explore\n` +
+					`Use task for: coder, scribe`,
+			)
 		},
 
 		// Inject delegation rules into system prompt
