@@ -1181,6 +1181,13 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			const agentName = output.args?.subagent_type
 			if (!agentName) return
 
+			// Guard: Only validate explicitly defined sub-agents
+			const agentsResult = await (client as OpencodeClient).app.agents({})
+			const agents = (agentsResult.data ?? []) as { name: string; mode?: string }[]
+			const agent = agents.find((a) => a.name === agentName)
+
+			if (!agent || agent.mode !== "subagent") return // Skip main/built-in agents
+
 			// Check if this agent is read-only
 			const readOnly = await isReadOnlyAgent(client as OpencodeClient, agentName)
 			if (readOnly) {
