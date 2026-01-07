@@ -46,6 +46,7 @@ interface GeneratedMetadata {
 async function generateMetadata(
 	client: OpencodeClient,
 	resultContent: string,
+	parentID: string,
 	debugLog: (msg: string) => Promise<void>,
 ): Promise<GeneratedMetadata> {
 	const fallbackMetadata = (): GeneratedMetadata => {
@@ -72,7 +73,10 @@ async function generateMetadata(
 
 		// Create a session for metadata generation
 		const session = await client.session.create({
-			body: { title: "Metadata Generation" },
+			body: {
+				title: "Metadata Generation",
+				parentID,
+			},
 		})
 
 		if (!session.data?.id) {
@@ -543,7 +547,9 @@ class DelegationManager {
 		const result = await this.getResult(delegation)
 
 		// Generate title and description using small model
-		const metadata = await generateMetadata(this.client, result, (msg) => this.debugLog(msg))
+		const metadata = await generateMetadata(this.client, result, delegation.sessionID, (msg) =>
+			this.debugLog(msg),
+		)
 		delegation.title = metadata.title
 		delegation.description = metadata.description
 
