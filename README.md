@@ -113,6 +113,10 @@ If you prefer not to use OCX, copy the source files from [`src/`](./src) to `.op
 
 This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco). For the full experience, check out [kdco-workspace](https://github.com/kdcokenny/ocx) which bundles background agents with specialist agents, planning tools, and notification support.
 
+## Disclaimer
+
+This project is not built by the OpenCode team and is not affiliated with [OpenCode](https://github.com/sst/opencode) in any way.
+
 ## License
 
 MIT
