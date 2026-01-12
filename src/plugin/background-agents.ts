@@ -9,11 +9,11 @@
  * https://github.com/code-yeongyu/oh-my-opencode
  */
 
-import * as crypto from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
+import { getProjectId } from "./worktree/state"
 import type { createOpencodeClient, Event, Message, Part, TextPart } from "@opencode-ai/sdk"
 import { adjectives, animals, colors, uniqueNamesGenerator } from "unique-names-generator"
 
@@ -205,6 +205,27 @@ interface DelegationListItem {
 }
 
 // ==========================================
+// LOGGING HELPER
+// ==========================================
+
+/**
+ * Create a structured logger that sends messages to OpenCode's log API.
+ * Catches errors silently to avoid disrupting tool execution.
+ */
+function createLogger(client: OpencodeClient) {
+	const log = (level: "debug" | "info" | "warn" | "error", message: string) =>
+		client.app.log({ body: { service: "background-agents", level, message } }).catch(() => {})
+	return {
+		debug: (msg: string) => log("debug", msg),
+		info: (msg: string) => log("info", msg),
+		warn: (msg: string) => log("warn", msg),
+		error: (msg: string) => log("error", msg),
+	}
+}
+
+type Logger = ReturnType<typeof createLogger>
+
+// ==========================================
 // AGENT CAPABILITY DETECTION
 // ==========================================
 
@@ -215,6 +236,7 @@ interface DelegationListItem {
 async function parseAgentMode(
 	client: OpencodeClient,
 	agentName: string,
+	log: Logger,
 ): Promise<{ isSubAgent: boolean }> {
 	try {
 		const result = await client.app.agents({})
@@ -224,9 +246,8 @@ async function parseAgentMode(
 	} catch (error) {
 		// Fail-safe: Agent list errors shouldn't block task calls
 		// Fail-loud: Log for observability
-		console.warn(
-			`[background-agents] Agent list fetch failed for "${agentName}", assuming non-sub-agent:`,
-			error,
+		log.warn(
+			`Agent list fetch failed for "${agentName}", assuming non-sub-agent: ${error instanceof Error ? error.message : String(error)}`,
 		)
 		return { isSubAgent: false }
 	}
@@ -259,6 +280,7 @@ function isPermissionDenied(entry: PermissionEntry | undefined): boolean {
 async function parseAgentWriteCapability(
 	client: OpencodeClient,
 	agentName: string,
+	log: Logger,
 ): Promise<{ isReadOnly: boolean }> {
 	try {
 		const config = await client.config.get()
@@ -280,9 +302,8 @@ async function parseAgentWriteCapability(
 	} catch (error) {
 		// Fail-safe: Config errors shouldn't block task calls
 		// Fail-loud: Log for observability
-		console.warn(
-			`[background-agents] Config fetch failed for "${agentName}", assuming write-capable:`,
-			error,
+		log.warn(
+			`Config fetch failed for "${agentName}", assuming write-capable: ${error instanceof Error ? error.message : String(error)}`,
 		)
 		return { isReadOnly: false }
 	}
@@ -295,12 +316,14 @@ class DelegationManager {
 	private delegations: Map<string, Delegation> = new Map()
 	private client: OpencodeClient
 	private baseDir: string
+	private log: Logger
 	// Track pending delegations per parent session for batched notifications
 	private pendingByParent: Map<string, Set<string>> = new Map()
 
-	constructor(client: OpencodeClient, baseDir: string) {
+	constructor(client: OpencodeClient, baseDir: string, log: Logger) {
 		this.client = client
 		this.baseDir = baseDir
+		this.log = log
 	}
 
 	/**
@@ -385,7 +408,7 @@ class DelegationManager {
 		}
 
 		// Check if agent is read-only (Early Exit + Fail Fast)
-		const { isReadOnly } = await parseAgentWriteCapability(this.client, input.agent)
+		const { isReadOnly } = await parseAgentWriteCapability(this.client, input.agent, this.log)
 		if (!isReadOnly) {
 			throw new Error(
 				`Agent "${input.agent}" is write-capable and requires the native \`task\` tool for proper undo/branching support.\n\n` +
@@ -1206,17 +1229,18 @@ interface SystemTransformInput {
 export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 	const { client, directory } = ctx
 
+	// Create logger early for all components
+	const log = createLogger(client as OpencodeClient)
+
 	// Project-level storage directory (shared across sessions)
-	// Matches logic in workspace-plugin.ts
-	const realDir = await fs.realpath(directory)
-	const normalizedDir = realDir.endsWith(path.sep) ? realDir.slice(0, -1) : realDir
-	const projectHash = crypto.createHash("sha256").update(normalizedDir).digest("hex").slice(0, 40)
-	const baseDir = path.join(os.homedir(), ".local", "share", "opencode", "delegations", projectHash)
+	// Uses git root commit hash for cross-worktree consistency
+	const projectId = await getProjectId(directory)
+	const baseDir = path.join(os.homedir(), ".local", "share", "opencode", "delegations", projectId)
 
 	// Ensure base directory exists (for debug logs etc)
 	await fs.mkdir(baseDir, { recursive: true })
 
-	const manager = new DelegationManager(client as OpencodeClient, baseDir)
+	const manager = new DelegationManager(client as OpencodeClient, baseDir, log)
 
 	await manager.debugLog("BackgroundAgentsPlugin initialized with delegation system")
 
@@ -1240,13 +1264,17 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			if (!agentName) return
 
 			// Parse boundary 1: Check agent mode
-			const { isSubAgent } = await parseAgentMode(client as OpencodeClient, agentName)
+			const { isSubAgent } = await parseAgentMode(client as OpencodeClient, agentName, log)
 
 			// Guard: Allow non-sub-agents (main/built-in)
 			if (!isSubAgent) return
 
 			// Parse boundary 2: Check write capability (only for sub-agents)
-			const { isReadOnly } = await parseAgentWriteCapability(client as OpencodeClient, agentName)
+			const { isReadOnly } = await parseAgentWriteCapability(
+				client as OpencodeClient,
+				agentName,
+				log,
+			)
 
 			// Guard: Allow write-capable agents
 			if (!isReadOnly) return
