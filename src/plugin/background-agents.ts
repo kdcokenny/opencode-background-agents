@@ -577,19 +577,10 @@ class DelegationManager {
 		}
 
 		// Create isolated session for delegation
-		// Anti-recursion: use permissions to disable nested delegations and state-modifying tools
 		const sessionResult = await this.client.session.create({
 			body: {
 				title: `Delegation: ${finalId}`,
 				parentID: input.parentSessionID,
-				permission: [
-					{ permission: "task", pattern: "*", action: "deny" },
-					{ permission: "delegate", pattern: "*", action: "deny" },
-					{ permission: "todowrite", pattern: "*", action: "deny" },
-					{ permission: "todoread", pattern: "*", action: "deny" },
-					{ permission: "plan_save", pattern: "*", action: "deny" },
-					{ permission: "plan_read", pattern: "*", action: "deny" },
-				],
 			},
 		})
 
@@ -645,12 +636,21 @@ class DelegationManager {
 
 		// Fire the prompt (using prompt() instead of promptAsync() to properly initialize agent loop)
 		// Agent param is critical for MCP tools - tells OpenCode which agent's config to use
+		// Anti-recursion: disable nested delegations and state-modifying tools via tools config
 		this.client.session
 			.prompt({
 				path: { id: delegation.sessionID },
 				body: {
 					agent: input.agent,
 					parts: [{ type: "text", text: input.prompt }],
+					tools: {
+						task: false,
+						delegate: false,
+						todowrite: false,
+						todoread: false,
+						plan_save: false,
+						plan_read: false,
+					},
 				},
 			})
 			.catch((error: Error) => {
