@@ -488,9 +488,7 @@ class DelegationManager {
 						task: false,
 						delegate: false,
 						todowrite: false,
-						todoread: false,
 						plan_save: false,
-						plan_read: false,
 					},
 				},
 			})
