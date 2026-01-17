@@ -38,7 +38,7 @@ ocx add kdco/workspace
 ```
 1. Delegate    →  "Research OAuth2 PKCE best practices"
 2. Continue    →  Keep coding, brainstorming, reviewing
-3. Notified    →  <system-reminder> tells you it's done
+3. Notified    →  <task-notification> tells you it's done
 4. Retrieve    →  AI calls delegation_read() to get the result
 ```
 
