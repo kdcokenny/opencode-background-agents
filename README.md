@@ -27,6 +27,8 @@ ocx registry add --name kdco https://registry.kdco.dev
 ocx add kdco/background-agents
 ```
 
+> **Tip:** Add `--global` to configure the registry globally instead of per-project.
+
 Want the full experience? Install `kdco-workspace` instead - it bundles background agents with specialist agents, planning tools, and research protocols:
 
 ```bash
