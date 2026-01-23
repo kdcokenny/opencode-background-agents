@@ -23,7 +23,7 @@ Install via [OCX](https://github.com/kdcokenny/ocx), the package manager for Ope
 curl -fsSL https://ocx.kdco.dev/install.sh | sh
 
 # Add the registry and install
-ocx registry add --name kdco https://registry.kdco.dev
+ocx registry add https://registry.kdco.dev --name kdco
 ocx add kdco/background-agents
 ```
 
