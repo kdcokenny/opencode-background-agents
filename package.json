@@ -1,0 +1,46 @@
+{
+  "name": "kdco-background-agents",
+  "version": "0.1.0",
+  "description": "Async background agents for OpenCode - lightweight delegation system",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kdcokenny/opencode-background-agents.git"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "registry.json"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/plugin/background-agents.d.ts",
+      "default": "./dist/plugin/background-agents.js"
+    }
+  },
+  "main": "./dist/plugin/background-agents.js",
+  "types": "./dist/plugin/background-agents.d.ts",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "bun build src/plugin/background-agents.ts --outdir dist/plugin --format esm --target bun && bun x tsc -p tsconfig.dts.json",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "publishConfig": {
+    "main": "./dist/plugin/background-agents.js",
+    "types": "./dist/plugin/background-agents.d.ts"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.2.15",
+    "@opencode-ai/sdk": "^1.2.15"
+  },
+  "dependencies": {
+    "unique-names-generator": "^4.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0"
+  }
+}
