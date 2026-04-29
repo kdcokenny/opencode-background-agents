@@ -12,6 +12,7 @@
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { fileURLToPath } from "node:url"
 import { type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
 import type { Event, Message, Part, TextPart } from "@opencode-ai/sdk"
 import { adjectives, animals, colors, uniqueNamesGenerator } from "unique-names-generator"
@@ -160,7 +161,7 @@ interface AssistantSessionMessageItem {
 	parts: Part[]
 }
 
-type DelegationStatus = "registered" | "running" | "complete" | "error" | "cancelled" | "timeout"
+export type DelegationStatus = "registered" | "running" | "complete" | "error" | "cancelled" | "timeout"
 
 type DelegationTerminalStatus = Extract<
 	DelegationStatus,
@@ -236,6 +237,22 @@ const DEFAULT_MAX_RUN_TIME_MS = 15 * 60 * 1000 // 15 minutes
 const TERMINAL_WAIT_GRACE_MS = 10_000
 const READ_POLL_INTERVAL_MS = 250
 const ALL_COMPLETE_QUIET_PERIOD_MS = 50
+const TUI_PERSISTED_SNAPSHOT_REFRESH_MS = 30_000
+const TUI_PERSISTED_HEADER_BYTES = 4096
+const TUI_PERSISTED_READ_LIMIT = 32
+const TUI_PERSISTED_ROOT_SCAN_LIMIT = 8
+const TUI_PERSISTED_FILE_CANDIDATE_SCAN_LIMIT = 96
+const TUI_PERSISTED_ROOT_CANDIDATE_SCAN_LIMIT = 32
+const TUI_LEGACY_CONFIG_FALLBACK_MARKER = ".legacy-config-project-fallback"
+const LIVE_DELEGATION_MANIFEST_FILE = "delegations.json"
+const LIVE_DELEGATION_MANIFEST_VERSION = 1
+const LIVE_DELEGATION_MANIFEST_MAX_RECORDS = 64
+const LIVE_DELEGATION_MANIFEST_MAX_BYTES = 128 * 1024
+const LIVE_DELEGATION_DESCRIPTION_MAX_LENGTH = 240
+const LIVE_DELEGATION_TITLE_MAX_LENGTH = 80
+const LIVE_DELEGATION_PROGRESS_WRITE_INTERVAL_MS = 5_000
+const LIVE_DELEGATION_STALE_ACTIVE_MS = DEFAULT_MAX_RUN_TIME_MS + TERMINAL_WAIT_GRACE_MS
+const GENERATED_DELEGATION_ID_PATTERN = /^[a-z0-9]+-[a-z0-9]+-[a-z0-9]+$/
 
 interface DelegateInput {
 	parentSessionID: string
@@ -252,15 +269,107 @@ interface DelegationListItem {
 	description?: string
 	agent?: string
 	unread?: boolean
+	startedAt?: Date
+	completedAt?: Date
+	projectId?: string
+	rootSessionID?: string
+	sessionID?: string
+	parentSessionID?: string
+	artifactPath?: string
+}
+
+interface DelegationManifestRecord {
+	id: string
+	status: DelegationStatus
+	projectId: string
+	rootSessionID: string
+	sessionID: string
+	parentSessionID: string
+	agent: string
+	title?: string
+	description?: string
+	createdAt: string
+	startedAt?: string
+	updatedAt: string
+	completedAt?: string
+	artifactPath?: string
+	unread?: boolean
+}
+
+interface DelegationManifest {
+	version: number
+	projectId: string
+	rootSessionID: string
+	updatedAt: string
+	delegations: DelegationManifestRecord[]
+}
+
+export interface DelegationSnapshotItem {
+	id: string
+	status: DelegationStatus
+	title: string
+	agent?: string
+	isActive: boolean
+	unread: boolean
+	startedAtMs: number
+	completedAtMs?: number
+	updatedAtMs: number
+}
+
+export interface DelegationSnapshot {
+	available: boolean
+	items: DelegationSnapshotItem[]
+	error?: {
+		kind: "manager-unavailable" | "refresh-error"
+		message: string
+	}
 }
 
 interface DelegationManagerOptions {
+	projectId?: string
+	projectDirectory?: string
 	maxRunTimeMs?: number
 	readPollIntervalMs?: number
 	terminalWaitGraceMs?: number
 	allCompleteQuietPeriodMs?: number
 	idGenerator?: () => string
 	metadataGenerator?: typeof generateMetadata
+}
+
+interface DelegationSnapshotOptions {
+	directory?: string
+	projectId?: string
+	limit?: number
+}
+
+interface PersistedSnapshotCache {
+	items: DelegationSnapshotItem[]
+	refreshedAtMs: number
+	lastRefreshError?: string
+	refreshPromise?: Promise<void>
+}
+
+interface PersistedDelegationSnapshotResult {
+	items: DelegationSnapshotItem[]
+	refreshError?: string
+}
+
+interface PersistedArtifactFile {
+	id: string
+	filePath: string
+	mtimeMs: number
+}
+
+interface PersistedSnapshotProjectScope {
+	projectId: string
+	baseDir: string
+	expectedProjectId: string
+	allowUnscopedHistory: boolean
+}
+
+interface PersistedDelegationReadScope {
+	expectedProjectId: string
+	allowArtifactsWithoutProjectMetadata: boolean
 }
 
 // ==========================================
@@ -385,6 +494,38 @@ function normalizeId(value: string): string {
 	return value.trim()
 }
 
+function parseGeneratedDelegationId(value: string): string {
+	const normalizedId = normalizeId(value)
+	if (!normalizedId) {
+		throw new Error("Delegation ID is required")
+	}
+
+	if (!GENERATED_DELEGATION_ID_PATTERN.test(normalizedId)) {
+		throw new Error(
+			`Invalid delegation ID "${normalizedId}". Expected generated ID format: word-word-word.`,
+		)
+	}
+
+	return normalizedId
+}
+
+function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
+	const resolvedDirectory = path.resolve(directoryPath)
+	const resolvedFilePath = path.resolve(filePath)
+	const relativePath = path.relative(resolvedDirectory, resolvedFilePath)
+
+	return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))
+}
+
+function buildContainedDelegationArtifactPath(rootDir: string, delegationId: string): string {
+	const artifactPath = path.resolve(rootDir, `${delegationId}.md`)
+	if (!isPathInsideDirectory(artifactPath, rootDir)) {
+		throw new Error(`Invalid delegation artifact path for ID "${delegationId}".`)
+	}
+
+	return artifactPath
+}
+
 function parsePersistedStatus(raw: string | undefined): DelegationStatus {
 	if (!raw) return "complete"
 	if (raw === "registered") return "registered"
@@ -396,13 +537,908 @@ function parsePersistedStatus(raw: string | undefined): DelegationStatus {
 	return "complete"
 }
 
-export class DelegationManager {
+function parseManifestStatus(raw: unknown): DelegationStatus | undefined {
+	if (raw === "registered") return "registered"
+	if (raw === "running") return "running"
+	if (raw === "complete") return "complete"
+	if (raw === "error") return "error"
+	if (raw === "cancelled") return "cancelled"
+	if (raw === "timeout") return "timeout"
+	return undefined
+}
+
+function parsePersistedDate(raw: string | undefined): Date | undefined {
+	if (!raw || raw === "N/A") return undefined
+
+	const date = new Date(raw)
+	if (Number.isNaN(date.getTime())) return undefined
+
+	return date
+}
+
+function normalizeManifestText(value: string): string {
+	return value.replace(/\s+/g, " ").trim()
+}
+
+function truncateManifestText(value: string | undefined, maxLength: number): string | undefined {
+	if (!value) return undefined
+
+	const normalizedValue = normalizeManifestText(value)
+	if (!normalizedValue) return undefined
+	if (normalizedValue.length <= maxLength) return normalizedValue
+	if (maxLength <= 1) return normalizedValue.slice(0, maxLength)
+
+	return `${normalizedValue.slice(0, maxLength - 1)}…`
+}
+
+function parseDelegationManifestRecord(raw: unknown): DelegationManifestRecord | undefined {
+	if (!raw || typeof raw !== "object") return undefined
+
+	const record = raw as Record<string, unknown>
+	const id = typeof record.id === "string" ? record.id.trim() : ""
+	const status = parseManifestStatus(record.status)
+	const projectId = typeof record.projectId === "string" ? record.projectId.trim() : ""
+	const rootSessionID =
+		typeof record.rootSessionID === "string" ? record.rootSessionID.trim() : ""
+	const sessionID = typeof record.sessionID === "string" ? record.sessionID.trim() : ""
+	const parentSessionID =
+		typeof record.parentSessionID === "string" ? record.parentSessionID.trim() : ""
+	const agent = typeof record.agent === "string" ? record.agent.trim() : ""
+	const createdAt = typeof record.createdAt === "string" ? record.createdAt : ""
+	const updatedAt = typeof record.updatedAt === "string" ? record.updatedAt : ""
+
+	if (!id || !status || !projectId || !rootSessionID || !sessionID || !parentSessionID) {
+		return undefined
+	}
+	if (!GENERATED_DELEGATION_ID_PATTERN.test(id)) return undefined
+	if (!parsePersistedDate(createdAt) || !parsePersistedDate(updatedAt)) return undefined
+
+	return {
+		id,
+		status,
+		projectId,
+		rootSessionID,
+		sessionID,
+		parentSessionID,
+		agent,
+		title:
+			typeof record.title === "string"
+				? truncateManifestText(record.title, LIVE_DELEGATION_TITLE_MAX_LENGTH)
+				: undefined,
+		description:
+			typeof record.description === "string"
+				? truncateManifestText(record.description, LIVE_DELEGATION_DESCRIPTION_MAX_LENGTH)
+				: undefined,
+		createdAt,
+		startedAt: typeof record.startedAt === "string" ? record.startedAt : undefined,
+		updatedAt,
+		completedAt: typeof record.completedAt === "string" ? record.completedAt : undefined,
+		artifactPath: typeof record.artifactPath === "string" ? record.artifactPath : undefined,
+		unread: record.unread === true,
+	}
+}
+
+function parseDelegationManifest(content: string): DelegationManifest | undefined {
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(content)
+	} catch {
+		return undefined
+	}
+
+	if (!parsed || typeof parsed !== "object") return undefined
+
+	const manifest = parsed as Record<string, unknown>
+	const projectId = typeof manifest.projectId === "string" ? manifest.projectId.trim() : ""
+	const rootSessionID =
+		typeof manifest.rootSessionID === "string" ? manifest.rootSessionID.trim() : ""
+	const updatedAt = typeof manifest.updatedAt === "string" ? manifest.updatedAt : ""
+	const rawDelegations = Array.isArray(manifest.delegations) ? manifest.delegations : []
+
+	if (manifest.version !== LIVE_DELEGATION_MANIFEST_VERSION) return undefined
+	if (!projectId || !rootSessionID || !parsePersistedDate(updatedAt)) return undefined
+
+	const delegations = rawDelegations
+		.map(parseDelegationManifestRecord)
+		.filter((record): record is DelegationManifestRecord => record !== undefined)
+		.slice(0, LIVE_DELEGATION_MANIFEST_MAX_RECORDS)
+
+	return {
+		version: LIVE_DELEGATION_MANIFEST_VERSION,
+		projectId,
+		rootSessionID,
+		updatedAt,
+		delegations,
+	}
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+	return error instanceof Error && "code" in error && error.code === code
+}
+
+async function readPersistedArtifactHeader(filePath: string): Promise<string | null> {
+	let fileHandle: fs.FileHandle | undefined
+	try {
+		fileHandle = await fs.open(filePath, "r")
+		const buffer = Buffer.alloc(TUI_PERSISTED_HEADER_BYTES)
+		const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, 0)
+		return buffer.subarray(0, bytesRead).toString("utf8")
+	} catch {
+		return null
+	} finally {
+		await fileHandle?.close().catch(() => undefined)
+	}
+}
+
+function parsePersistedDelegationHeader(id: string, content: string | null): DelegationListItem {
+	if (!content) {
+		return {
+			id,
+			status: "complete",
+			title: "(loaded from storage)",
+			description: "",
+			unread: false,
+		}
+	}
+
+	const titleMatch = content.match(/^# (.+)$/m)
+	const agentMatch = content.match(/^\*\*Agent:\*\* (.+)$/m)
+	const statusMatch = content.match(/^\*\*Status:\*\* (.+)$/m)
+	const projectMatch = content.match(/^\*\*Project ID:\*\* (.+)$/m)
+	const rootSessionMatch = content.match(/^\*\*Root Session:\*\* (.+)$/m)
+	const sessionMatch = content.match(/^\*\*Session:\*\* (.+)$/m)
+	const startedMatch = content.match(/^\*\*Started:\*\* (.+)$/m)
+	const completedMatch = content.match(/^\*\*Completed:\*\* (.+)$/m)
+	const description = content.split("\n")[2]?.slice(0, 150) ?? ""
+
+	return {
+		id,
+		status: parsePersistedStatus(statusMatch?.[1]?.trim()),
+		title: titleMatch?.[1] ?? "(loaded from storage)",
+		description,
+		agent: agentMatch?.[1],
+		unread: false,
+		startedAt: parsePersistedDate(startedMatch?.[1]?.trim()),
+		completedAt: parsePersistedDate(completedMatch?.[1]?.trim()),
+		projectId: projectMatch?.[1]?.trim(),
+		rootSessionID: rootSessionMatch?.[1]?.trim(),
+		sessionID: sessionMatch?.[1]?.trim(),
+	}
+}
+
+function isPersistedDelegationInScope(
+	delegation: DelegationListItem,
+	scope: PersistedDelegationReadScope,
+): boolean {
+	if (delegation.projectId) return delegation.projectId === scope.expectedProjectId
+	return scope.allowArtifactsWithoutProjectMetadata
+}
+
+function toSnapshotItemFromPersistedDelegation(
+	delegation: DelegationListItem,
+): DelegationSnapshotItem | undefined {
+	const startedAt = delegation.startedAt ?? delegation.completedAt
+	if (!startedAt) return undefined
+
+	return {
+		id: delegation.id,
+		status: delegation.status,
+		title: delegation.title || delegation.id,
+		agent: delegation.agent,
+		isActive: isActiveStatus(delegation.status),
+		unread: delegation.unread ?? false,
+		startedAtMs: startedAt.getTime(),
+		completedAtMs: delegation.completedAt?.getTime(),
+		updatedAtMs: delegation.completedAt?.getTime() ?? startedAt.getTime(),
+	}
+}
+
+function toSnapshotItemFromManifestRecord(
+	record: DelegationManifestRecord,
+): DelegationSnapshotItem | undefined {
+	const createdAt = parsePersistedDate(record.createdAt)
+	const startedAt = parsePersistedDate(record.startedAt) ?? createdAt
+	const updatedAt = parsePersistedDate(record.updatedAt)
+	const completedAt = parsePersistedDate(record.completedAt)
+
+	if (!startedAt || !updatedAt) return undefined
+	const status = getManifestSnapshotStatus(record.status, startedAt, updatedAt)
+
+	return {
+		id: record.id,
+		status,
+		title: record.title || record.id,
+		agent: record.agent,
+		isActive: isActiveStatus(status),
+		unread: record.unread ?? false,
+		startedAtMs: startedAt.getTime(),
+		completedAtMs: completedAt?.getTime(),
+		updatedAtMs: updatedAt.getTime(),
+	}
+}
+
+function getManifestSnapshotStatus(
+	status: DelegationStatus,
+	startedAt: Date,
+	updatedAt: Date,
+): DelegationStatus {
+	if (!isActiveStatus(status)) return status
+
+	const freshestActivityAtMs = Math.max(startedAt.getTime(), updatedAt.getTime())
+	if (Date.now() - freshestActivityAtMs <= LIVE_DELEGATION_STALE_ACTIVE_MS) return status
+
+	return "timeout"
+}
+
+async function readDelegationManifest(rootDir: string): Promise<DelegationManifest | undefined> {
+	const manifestPath = path.join(rootDir, LIVE_DELEGATION_MANIFEST_FILE)
+	const stats = await fs.stat(manifestPath).catch((error: unknown) => {
+		if (isNodeErrorWithCode(error, "ENOENT")) return undefined
+		throw error
+	})
+
+	if (!stats?.isFile()) return undefined
+	if (stats.size > LIVE_DELEGATION_MANIFEST_MAX_BYTES) {
+		console.warn(
+			`[background-agents] Ignoring oversized delegation manifest at ${manifestPath}; size=${stats.size}; max=${LIVE_DELEGATION_MANIFEST_MAX_BYTES}`,
+		)
+		return undefined
+	}
+
+	const content = await fs.readFile(manifestPath, "utf8").catch((error: unknown) => {
+		if (isNodeErrorWithCode(error, "ENOENT")) return undefined
+		throw error
+	})
+
+	if (!content) return undefined
+	return parseDelegationManifest(content)
+}
+
+async function readManifestSnapshotFromRootDir(
+	rootDir: string,
+	limit: number,
+	scope: PersistedDelegationReadScope,
+	rootSessionID: string,
+): Promise<DelegationSnapshotItem[]> {
+	const manifest = await readDelegationManifest(rootDir)
+	if (!manifest) return []
+	if (manifest.projectId !== scope.expectedProjectId) return []
+	if (manifest.rootSessionID !== rootSessionID) return []
+
+	return manifest.delegations
+		.filter((record) => record.projectId === scope.expectedProjectId)
+		.filter((record) => record.rootSessionID === rootSessionID)
+		.map(toSnapshotItemFromManifestRecord)
+		.filter((item): item is DelegationSnapshotItem => item !== undefined)
+		.sort((a, b) => b.updatedAtMs - a.updatedAtMs)
+		.slice(0, Math.min(limit, LIVE_DELEGATION_MANIFEST_MAX_RECORDS))
+}
+
+function mergeDelegationSnapshotItems(
+	manifestItems: DelegationSnapshotItem[],
+	artifactItems: DelegationSnapshotItem[],
+	limit: number,
+): DelegationSnapshotItem[] {
+	const snapshotsById = new Map<string, DelegationSnapshotItem>()
+
+	for (const manifestItem of manifestItems) {
+		snapshotsById.set(manifestItem.id, manifestItem)
+	}
+
+	for (const artifactItem of artifactItems) {
+		const existingItem = snapshotsById.get(artifactItem.id)
+		if (existingItem?.isActive) continue
+
+		snapshotsById.set(artifactItem.id, artifactItem)
+	}
+
+	return Array.from(snapshotsById.values())
+		.sort((a, b) => {
+			if (a.isActive !== b.isActive) return a.isActive ? -1 : 1
+			return b.updatedAtMs - a.updatedAtMs
+		})
+		.slice(0, limit)
+}
+
+async function closeDirQuietly(directory: fs.Dir | undefined): Promise<void> {
+	if (!directory) return
+
+	try {
+		await Promise.resolve(directory.close())
+	} catch {
+		// Directory handles can already be closed by async iteration.
+	}
+}
+
+async function listRecentPersistedArtifactFiles(
+	dir: string,
+	readLimit: number,
+): Promise<PersistedArtifactFile[]> {
+	const artifactFiles: PersistedArtifactFile[] = []
+	const maxCandidates = Math.min(
+		Math.max(readLimit * 4, readLimit, 1),
+		TUI_PERSISTED_FILE_CANDIDATE_SCAN_LIMIT,
+	)
+
+	let directory: fs.Dir | undefined
+	try {
+		directory = await fs.opendir(dir)
+		for await (const entry of directory) {
+			if (artifactFiles.length >= maxCandidates) break
+			if (!entry.isFile() || !entry.name.endsWith(".md")) continue
+
+			const filePath = path.join(dir, entry.name)
+			try {
+				const stats = await fs.stat(filePath)
+				artifactFiles.push({
+					id: entry.name.replace(".md", ""),
+					filePath,
+					mtimeMs: stats.mtimeMs,
+				})
+			} catch (error) {
+				if (isNodeErrorWithCode(error, "ENOENT")) continue
+				throw error
+			}
+		}
+	} catch (error) {
+		if (!isNodeErrorWithCode(error, "ENOENT")) throw error
+	} finally {
+		await closeDirQuietly(directory)
+	}
+
+	return artifactFiles
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, readLimit)
+}
+
+async function readPersistedSnapshotFromRootDir(
+	rootDir: string,
+	limit: number,
+	scope: PersistedDelegationReadScope,
+): Promise<DelegationSnapshotItem[]> {
+	const readLimit = Math.min(Math.max(limit * 4, limit, 1), TUI_PERSISTED_READ_LIMIT)
+	const artifactFiles = await listRecentPersistedArtifactFiles(rootDir, readLimit)
+	const persistedItems: DelegationSnapshotItem[] = []
+
+	for (const file of artifactFiles) {
+		const content = await readPersistedArtifactHeader(file.filePath)
+		const delegation = parsePersistedDelegationHeader(file.id, content)
+		if (!isPersistedDelegationInScope(delegation, scope)) continue
+
+		const snapshotItem = toSnapshotItemFromPersistedDelegation(delegation)
+		if (snapshotItem) persistedItems.push(snapshotItem)
+	}
+
+	return persistedItems.sort((a, b) => b.updatedAtMs - a.updatedAtMs).slice(0, limit)
+}
+
+async function listRecentPersistedRootDirs(baseDir: string): Promise<string[]> {
+	const rootDirs: { dir: string; mtimeMs: number }[] = []
+	let directory: fs.Dir | undefined
+	try {
+		directory = await fs.opendir(baseDir)
+		for await (const entry of directory) {
+			if (rootDirs.length >= TUI_PERSISTED_ROOT_CANDIDATE_SCAN_LIMIT) break
+			if (!entry.isDirectory()) continue
+
+			const dir = path.join(baseDir, entry.name)
+			try {
+				const stats = await fs.stat(dir)
+				rootDirs.push({ dir, mtimeMs: stats.mtimeMs })
+			} catch (error) {
+				if (isNodeErrorWithCode(error, "ENOENT")) continue
+				throw error
+			}
+		}
+	} catch (error) {
+		if (!isNodeErrorWithCode(error, "ENOENT")) throw error
+	} finally {
+		await closeDirQuietly(directory)
+	}
+
+	return rootDirs
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, TUI_PERSISTED_ROOT_SCAN_LIMIT)
+		.map((item) => item.dir)
+}
+
+async function readPersistedSnapshotFromProjectHistory(
+	scope: PersistedSnapshotProjectScope,
+	sessionID: string,
+	limit: number,
+): Promise<DelegationSnapshotItem[]> {
+	const snapshotsById = new Map<string, DelegationSnapshotItem>()
+	const sessionRootDir = path.join(scope.baseDir, sessionID)
+	const sessionReadScope: PersistedDelegationReadScope = {
+		expectedProjectId: scope.expectedProjectId,
+		allowArtifactsWithoutProjectMetadata: true,
+	}
+	const historyReadScope: PersistedDelegationReadScope = {
+		expectedProjectId: scope.expectedProjectId,
+		allowArtifactsWithoutProjectMetadata: scope.allowUnscopedHistory,
+	}
+	const manifestItems = await readManifestSnapshotFromRootDir(
+		sessionRootDir,
+		limit,
+		sessionReadScope,
+		sessionID,
+	)
+	const sessionArtifactItems = await readPersistedSnapshotFromRootDir(
+		sessionRootDir,
+		limit,
+		sessionReadScope,
+	)
+
+	for (const item of mergeDelegationSnapshotItems(manifestItems, sessionArtifactItems, limit)) {
+		snapshotsById.set(item.id, item)
+	}
+
+	if (snapshotsById.size >= limit) {
+		return Array.from(snapshotsById.values()).slice(0, limit)
+	}
+
+	const rootDirs = await listRecentPersistedRootDirs(scope.baseDir)
+	for (const rootDir of rootDirs) {
+		if (rootDir === sessionRootDir) continue
+
+		for (const item of await readPersistedSnapshotFromRootDir(rootDir, limit, historyReadScope)) {
+			if (!snapshotsById.has(item.id)) snapshotsById.set(item.id, item)
+		}
+
+		if (snapshotsById.size >= limit) break
+	}
+
+	return Array.from(snapshotsById.values())
+		.sort((a, b) => b.updatedAtMs - a.updatedAtMs)
+		.slice(0, limit)
+}
+
+function getConfigDirectoryCandidate(): string {
+	const pluginDirectory = path.dirname(fileURLToPath(import.meta.url))
+	return path.resolve(pluginDirectory, "..")
+}
+
+function getDelegationProjectBaseDir(projectId: string): string {
+	return path.join(os.homedir(), ".local", "share", "opencode", "delegations", projectId)
+}
+
+async function hasLegacyConfigProjectFallbackMarker(
+	activeProjectBaseDir: string,
+	configProjectId: string,
+): Promise<boolean> {
+	const markerPath = path.join(activeProjectBaseDir, TUI_LEGACY_CONFIG_FALLBACK_MARKER)
+	const marker = await fs.readFile(markerPath, "utf8").catch((error: unknown) => {
+		if (isNodeErrorWithCode(error, "ENOENT")) return undefined
+		throw error
+	})
+
+	if (!marker) return false
+
+	const normalizedMarker = marker.trim()
+	return normalizedMarker === configProjectId || normalizedMarker === "opencode-config"
+}
+
+async function resolvePersistedSnapshotProjectScopes(
+	options: DelegationSnapshotOptions,
+	registryProjectId: string | undefined,
+): Promise<PersistedSnapshotProjectScope[]> {
+	const projectIds = new Set<string>()
+	if (options.projectId) projectIds.add(options.projectId)
+	if (registryProjectId) projectIds.add(registryProjectId)
+
+	if (options.directory) {
+		const directoryProjectId = await getProjectId(options.directory).catch(() => undefined)
+		if (directoryProjectId) projectIds.add(directoryProjectId)
+	}
+
+	const scopes = Array.from(projectIds).map((projectId): PersistedSnapshotProjectScope => ({
+		projectId,
+		baseDir: getDelegationProjectBaseDir(projectId),
+		expectedProjectId: projectId,
+		allowUnscopedHistory: true,
+	}))
+
+	const configProjectId = await getProjectId(getConfigDirectoryCandidate()).catch(() => undefined)
+	if (!configProjectId || projectIds.has(configProjectId)) return scopes
+
+	for (const activeProjectId of projectIds) {
+		const activeProjectBaseDir = getDelegationProjectBaseDir(activeProjectId)
+		if (!(await hasLegacyConfigProjectFallbackMarker(activeProjectBaseDir, configProjectId))) continue
+
+		scopes.push({
+			projectId: configProjectId,
+			baseDir: getDelegationProjectBaseDir(configProjectId),
+			expectedProjectId: activeProjectId,
+			allowUnscopedHistory: false,
+		})
+		break
+	}
+
+	return scopes
+}
+
+const persistedSnapshotCacheByScope = new Map<string, PersistedSnapshotCache>()
+
+function getPersistedSnapshotCacheKey(
+	sessionID: string,
+	limit: number,
+	scopes: PersistedSnapshotProjectScope[],
+): string {
+	const scopeKey = scopes
+		.map((scope) =>
+			[
+				scope.projectId,
+				scope.expectedProjectId,
+				scope.allowUnscopedHistory ? "unscoped-history" : "scoped-history",
+			].join(":"),
+		)
+		.join("|")
+	return `${sessionID}:${limit}:${scopeKey}`
+}
+
+function toPersistedDelegationSnapshotResult(
+	cache: PersistedSnapshotCache,
+	limit: number,
+	liveItems: DelegationSnapshotItem[] = [],
+): PersistedDelegationSnapshotResult {
+	return {
+		items: mergeDelegationSnapshotItems(liveItems, cache.items, limit),
+		...(cache.lastRefreshError ? { refreshError: cache.lastRefreshError } : {}),
+	}
+}
+
+function logPersistedSnapshotRefreshFailure(input: {
+	sessionID: string
+	options: DelegationSnapshotOptions
+	registryProjectId: string | undefined
+	scopes: PersistedSnapshotProjectScope[]
+	message: string
+}): void {
+	const requestedProjectId = input.options.projectId ?? input.registryProjectId ?? "none"
+	const requestedDirectory = input.options.directory ?? "none"
+	const scopeSummary = input.scopes
+		.map((scope) => `${scope.projectId}->${scope.expectedProjectId}`)
+		.join(",")
+
+	console.warn(
+		`[background-agents] TUI persisted snapshot refresh failed for ${input.sessionID}; directory=${requestedDirectory}; projectId=${requestedProjectId}; scopes=${scopeSummary || "none"}: ${input.message}`,
+	)
+}
+
+async function readPersistedDelegationSnapshot(
+	sessionID: string,
+	limit: number,
+	scopes: PersistedSnapshotProjectScope[],
+): Promise<DelegationSnapshotItem[]> {
+	const snapshotsById = new Map<string, DelegationSnapshotItem>()
+
+	for (const scope of scopes) {
+		for (const item of await readPersistedSnapshotFromProjectHistory(scope, sessionID, limit)) {
+			if (!snapshotsById.has(item.id)) snapshotsById.set(item.id, item)
+		}
+
+		if (snapshotsById.size >= limit) break
+	}
+
+	return Array.from(snapshotsById.values())
+		.sort((a, b) => b.updatedAtMs - a.updatedAtMs)
+		.slice(0, limit)
+}
+
+async function readLiveDelegationManifestSnapshot(
+	sessionID: string,
+	limit: number,
+	scopes: PersistedSnapshotProjectScope[],
+): Promise<DelegationSnapshotItem[]> {
+	const snapshotsById = new Map<string, DelegationSnapshotItem>()
+
+	for (const scope of scopes) {
+		const rootDir = path.join(scope.baseDir, sessionID)
+		const readScope: PersistedDelegationReadScope = {
+			expectedProjectId: scope.expectedProjectId,
+			allowArtifactsWithoutProjectMetadata: false,
+		}
+
+		for (const item of await readManifestSnapshotFromRootDir(rootDir, limit, readScope, sessionID)) {
+			if (!snapshotsById.has(item.id)) snapshotsById.set(item.id, item)
+		}
+	}
+
+	return Array.from(snapshotsById.values())
+		.sort((a, b) => b.updatedAtMs - a.updatedAtMs)
+		.slice(0, limit)
+}
+
+async function getPersistedDelegationSnapshot(
+	sessionID: string,
+	options: DelegationSnapshotOptions,
+	registryProjectId: string | undefined,
+): Promise<PersistedDelegationSnapshotResult> {
+	const limit = options.limit ?? 8
+	const scopes = await resolvePersistedSnapshotProjectScopes(options, registryProjectId)
+	if (scopes.length === 0) return { items: [] }
+	const liveItems = await readLiveDelegationManifestSnapshot(sessionID, limit, scopes)
+
+	const cacheKey = getPersistedSnapshotCacheKey(sessionID, limit, scopes)
+	const cached = persistedSnapshotCacheByScope.get(cacheKey)
+	const now = Date.now()
+	if (cached?.refreshPromise && cached.items.length > 0) {
+		return toPersistedDelegationSnapshotResult(cached, limit, liveItems)
+	}
+	if (cached?.refreshPromise) {
+		if (liveItems.length > 0) return toPersistedDelegationSnapshotResult(cached, limit, liveItems)
+		await cached.refreshPromise
+		return toPersistedDelegationSnapshotResult(cached, limit, liveItems)
+	}
+	if (cached && now - cached.refreshedAtMs < TUI_PERSISTED_SNAPSHOT_REFRESH_MS) {
+		return toPersistedDelegationSnapshotResult(cached, limit, liveItems)
+	}
+
+	const cache = cached ?? { items: [], refreshedAtMs: 0 }
+	persistedSnapshotCacheByScope.set(cacheKey, cache)
+
+	cache.refreshPromise = readPersistedDelegationSnapshot(sessionID, limit, scopes)
+		.then((items) => {
+			cache.items = items
+			cache.refreshedAtMs = Date.now()
+			cache.lastRefreshError = undefined
+		})
+		.catch((error) => {
+			const message = error instanceof Error ? error.message : "Unknown error"
+			cache.refreshedAtMs = Date.now()
+			cache.lastRefreshError = message
+			logPersistedSnapshotRefreshFailure({
+				sessionID,
+				options,
+				registryProjectId,
+				scopes,
+				message,
+			})
+		})
+		.finally(() => {
+			cache.refreshPromise = undefined
+		})
+
+	if (cache.items.length > 0 || liveItems.length > 0) {
+		return toPersistedDelegationSnapshotResult(cache, limit, liveItems)
+	}
+
+	await cache.refreshPromise
+	return toPersistedDelegationSnapshotResult(cache, limit, liveItems)
+}
+
+async function getPersistedDelegationSnapshotForTui(
+	sessionID: string,
+	options: DelegationSnapshotOptions,
+	registryProjectId: string | undefined,
+): Promise<PersistedDelegationSnapshotResult> {
+	try {
+		return await getPersistedDelegationSnapshot(sessionID, options, registryProjectId)
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "Unknown delegation refresh error"
+		console.warn(
+			`[background-agents] TUI persisted snapshot fallback failed for ${sessionID}; directory=${options.directory ?? "none"}; projectId=${options.projectId ?? registryProjectId ?? "none"}: ${message}`,
+		)
+		return { items: [], refreshError: message }
+	}
+}
+
+function toDelegationSnapshotItem(delegation: DelegationRecord): DelegationSnapshotItem {
+	const startedAt = delegation.startedAt ?? delegation.createdAt
+	const completedAt = delegation.completedAt
+
+	return {
+		id: delegation.id,
+		status: delegation.status,
+		title: delegation.title || delegation.id,
+		agent: delegation.agent,
+		isActive: isActiveStatus(delegation.status),
+		unread: false,
+		startedAtMs: startedAt.getTime(),
+		completedAtMs: completedAt?.getTime(),
+		updatedAtMs: delegation.updatedAt.getTime(),
+	}
+}
+
+const delegationManagerRegistryKey = "__opencodeBackgroundAgentsManagerRegistry"
+const snapshotRegistryLookupByDirectory = new Map<string, { keys: string[]; projectId?: string }>()
+type GlobalWithDelegationManagerRegistry = typeof globalThis & {
+	[delegationManagerRegistryKey]?: Map<string, DelegationManager>
+}
+
+function getDelegationManagerRegistry(): Map<string, DelegationManager> {
+	const globalWithRegistry = globalThis as GlobalWithDelegationManagerRegistry
+	if (globalWithRegistry[delegationManagerRegistryKey]) {
+		return globalWithRegistry[delegationManagerRegistryKey]
+	}
+
+	const registry = new Map<string, DelegationManager>()
+	globalWithRegistry[delegationManagerRegistryKey] = registry
+	return registry
+}
+
+function normalizeProjectDirectory(directory: string | undefined): string | undefined {
+	if (!directory?.trim()) return undefined
+	return path.resolve(directory)
+}
+
+function getDelegationManagerRegistryKeys(input: {
+	projectId?: string
+	baseDir?: string
+	directory?: string
+}): string[] {
+	const keys: string[] = []
+	const directory = normalizeProjectDirectory(input.directory)
+	if (directory) keys.push(`directory:${directory}`)
+	if (input.projectId) keys.push(`project:${input.projectId}`)
+	if (input.baseDir) keys.push(`baseDir:${input.baseDir}`)
+
+	return keys
+}
+
+function setActiveDelegationManager(manager: DelegationManager): void {
+	const registry = getDelegationManagerRegistry()
+	for (const key of manager.getRegistryKeys()) {
+		registry.set(key, manager)
+	}
+}
+
+async function resolveSnapshotRegistryLookup(options: DelegationSnapshotOptions): Promise<{
+	keys: string[]
+	projectId?: string
+}> {
+	if (options.projectId) {
+		return {
+			keys: getDelegationManagerRegistryKeys({
+				projectId: options.projectId,
+				directory: options.directory,
+			}),
+			projectId: options.projectId,
+		}
+	}
+
+	const directory = normalizeProjectDirectory(options.directory)
+	if (!directory) return { keys: [] }
+
+	const cachedLookup = snapshotRegistryLookupByDirectory.get(directory)
+	if (cachedLookup) return cachedLookup
+
+	const projectId = await getProjectId(directory)
+	const baseDir = path.join(os.homedir(), ".local", "share", "opencode", "delegations", projectId)
+	const lookup = {
+		keys: getDelegationManagerRegistryKeys({ projectId, baseDir, directory }),
+		projectId,
+	}
+	snapshotRegistryLookupByDirectory.set(directory, lookup)
+	return lookup
+}
+
+function parseSnapshotOptions(
+	optionsOrLimit: DelegationSnapshotOptions | number | undefined,
+): DelegationSnapshotOptions {
+	if (typeof optionsOrLimit === "number") return { limit: optionsOrLimit }
+	return optionsOrLimit ?? {}
+}
+
+export async function getDelegationSnapshot(
+	sessionID: string,
+	optionsOrLimit?: DelegationSnapshotOptions | number,
+): Promise<DelegationSnapshot> {
+	const options = parseSnapshotOptions(optionsOrLimit)
+	const registryLookup: { keys: string[]; projectId?: string } = await resolveSnapshotRegistryLookup(
+		options,
+	).catch(() => ({ keys: [] }))
+	const registry = getDelegationManagerRegistry()
+	const manager = registryLookup.keys.map((key) => registry.get(key)).find((item) => item !== undefined)
+
+	if (!manager) {
+		const persistedSnapshot = await getPersistedDelegationSnapshotForTui(
+			sessionID,
+			options,
+			registryLookup.projectId,
+		)
+
+		if (persistedSnapshot.refreshError) {
+			return {
+				available: true,
+				items: persistedSnapshot.items,
+				error: {
+					kind: "refresh-error",
+					message: persistedSnapshot.refreshError,
+				},
+			}
+		}
+
+		if (persistedSnapshot.items.length > 0) {
+			return {
+				available: true,
+				items: persistedSnapshot.items,
+			}
+		}
+
+		return {
+			available: false,
+			items: [],
+			error: {
+				kind: "manager-unavailable",
+				message: "No background agent manager is registered for this project.",
+			},
+		}
+	}
+
+	if (!manager.matchesProject({ projectId: registryLookup.projectId, directory: options.directory })) {
+		const persistedSnapshot = await getPersistedDelegationSnapshotForTui(
+			sessionID,
+			options,
+			registryLookup.projectId,
+		)
+
+		if (persistedSnapshot.refreshError) {
+			return {
+				available: true,
+				items: persistedSnapshot.items,
+				error: {
+					kind: "refresh-error",
+					message: persistedSnapshot.refreshError,
+				},
+			}
+		}
+
+		if (persistedSnapshot.items.length > 0) {
+			return {
+				available: true,
+				items: persistedSnapshot.items,
+			}
+		}
+
+		return {
+			available: false,
+			items: [],
+			error: {
+				kind: "manager-unavailable",
+				message: "Background agent manager does not match this project.",
+			},
+		}
+	}
+
+	try {
+		const items = await manager.getSnapshot(sessionID, options.limit ?? 8)
+		const refreshError = await manager.getSnapshotRefreshError(sessionID)
+
+		return {
+			available: true,
+			items,
+			...(refreshError
+				? {
+						error: {
+							kind: "refresh-error" as const,
+							message: refreshError,
+						},
+					}
+				: {}),
+		}
+	} catch (error) {
+		return {
+			available: true,
+			items: [],
+			error: {
+				kind: "refresh-error",
+				message: error instanceof Error ? error.message : "Unknown delegation refresh error",
+			},
+		}
+	}
+}
+
+class DelegationManager {
 	private delegations: Map<string, DelegationRecord> = new Map()
 	private delegationsBySession: Map<string, string> = new Map()
 	private terminalWaiters: Map<string, { promise: Promise<void>; resolve: () => void }> = new Map()
 	private timeoutTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+	private persistedSnapshotCacheByRoot: Map<string, PersistedSnapshotCache> = new Map()
 	private client: OpencodeClient
 	private baseDir: string
+	private projectId?: string
+	private projectDirectory?: string
 	private log: Logger
 	private maxRunTimeMs: number
 	private readPollIntervalMs: number
@@ -412,6 +1448,8 @@ export class DelegationManager {
 	private metadataGenerator: typeof generateMetadata
 	private pendingByParent: Map<string, Set<string>> = new Map()
 	private parentNotificationState: Map<string, ParentNotificationState> = new Map()
+	private liveManifestWritesByRoot: Map<string, Promise<void>> = new Map()
+	private lastLiveManifestProgressWriteAtByRoot: Map<string, number> = new Map()
 
 	constructor(
 		client: OpencodeClient,
@@ -421,6 +1459,8 @@ export class DelegationManager {
 	) {
 		this.client = client
 		this.baseDir = baseDir
+		this.projectId = options.projectId
+		this.projectDirectory = normalizeProjectDirectory(options.projectDirectory)
 		this.log = log
 		this.maxRunTimeMs = options.maxRunTimeMs ?? DEFAULT_MAX_RUN_TIME_MS
 		this.readPollIntervalMs = options.readPollIntervalMs ?? READ_POLL_INTERVAL_MS
@@ -428,6 +1468,22 @@ export class DelegationManager {
 		this.allCompleteQuietPeriodMs = options.allCompleteQuietPeriodMs ?? ALL_COMPLETE_QUIET_PERIOD_MS
 		this.idGenerator = options.idGenerator ?? generateReadableId
 		this.metadataGenerator = options.metadataGenerator ?? generateMetadata
+	}
+
+	getRegistryKeys(): string[] {
+		return getDelegationManagerRegistryKeys({
+			projectId: this.projectId,
+			baseDir: this.baseDir,
+			directory: this.projectDirectory,
+		})
+	}
+
+	matchesProject(input: { projectId?: string; directory?: string }): boolean {
+		const requestedDirectory = normalizeProjectDirectory(input.directory)
+		if (requestedDirectory && this.projectDirectory) return requestedDirectory === this.projectDirectory
+		if (input.projectId && this.projectId) return input.projectId === this.projectId
+
+		return true
 	}
 
 	/**
@@ -644,10 +1700,12 @@ export class DelegationManager {
 	}
 
 	private markNotified(id: string): DelegationRecord | undefined {
-		return this.updateDelegation(id, (delegation, now) => {
+		const delegation = this.updateDelegation(id, (delegation, now) => {
 			delegation.notification.terminalNotifiedAt = now
 			delegation.notification.terminalNotificationCount += 1
 		})
+		if (delegation) this.persistLiveManifestSoon(delegation.rootSessionID)
+		return delegation
 	}
 
 	private getParentNotificationState(parentSessionID: string): ParentNotificationState {
@@ -775,11 +1833,13 @@ export class DelegationManager {
 	}
 
 	private markRetrieved(id: string, readerSessionID: string): DelegationRecord | undefined {
-		return this.updateDelegation(id, (delegation, now) => {
+		const delegation = this.updateDelegation(id, (delegation, now) => {
 			delegation.retrieval.retrievedAt = now
 			delegation.retrieval.retrievalCount += 1
 			delegation.retrieval.lastReaderSessionID = readerSessionID
 		})
+		if (delegation) this.persistLiveManifestSoon(delegation.rootSessionID)
+		return delegation
 	}
 
 	private hasUnreadCompletion(delegation: DelegationRecord): boolean {
@@ -789,6 +1849,13 @@ export class DelegationManager {
 
 		if (!delegation.retrieval.retrievedAt) return true
 		return delegation.retrieval.retrievedAt.getTime() < delegation.completedAt.getTime()
+	}
+
+	private toSnapshotItem(delegation: DelegationRecord): DelegationSnapshotItem {
+		return {
+			...toDelegationSnapshotItem(delegation),
+			unread: this.hasUnreadCompletion(delegation),
+		}
 	}
 
 	private async waitForTerminal(id: string, timeoutMs: number): Promise<"terminal" | "timeout"> {
@@ -903,6 +1970,121 @@ export class DelegationManager {
 		}
 	}
 
+	private async readPersistedArtifactHeader(filePath: string): Promise<string | null> {
+		return await readPersistedArtifactHeader(filePath)
+	}
+
+	private parsePersistedDelegationHeader(id: string, content: string | null): DelegationListItem {
+		return parsePersistedDelegationHeader(id, content)
+	}
+
+	private toSnapshotItemFromListItem(delegation: DelegationListItem): DelegationSnapshotItem | undefined {
+		return toSnapshotItemFromPersistedDelegation(delegation)
+	}
+
+	private getRootDelegationsDir(rootSessionID: string): string {
+		return path.join(this.baseDir, rootSessionID)
+	}
+
+	private getLiveManifestPath(rootSessionID: string): string {
+		return path.join(this.getRootDelegationsDir(rootSessionID), LIVE_DELEGATION_MANIFEST_FILE)
+	}
+
+	private toManifestRecord(delegation: DelegationRecord): DelegationManifestRecord {
+		const description = truncateManifestText(
+			delegation.description || delegation.progress.lastMessage || delegation.prompt,
+			LIVE_DELEGATION_DESCRIPTION_MAX_LENGTH,
+		)
+
+		return {
+			id: delegation.id,
+			status: delegation.status,
+			projectId: this.projectId ?? "unknown",
+			rootSessionID: delegation.rootSessionID,
+			sessionID: delegation.sessionID,
+			parentSessionID: delegation.parentSessionID,
+			agent: delegation.agent,
+			title: truncateManifestText(
+				delegation.title || delegation.id,
+				LIVE_DELEGATION_TITLE_MAX_LENGTH,
+			),
+			description,
+			createdAt: delegation.createdAt.toISOString(),
+			startedAt: delegation.startedAt?.toISOString(),
+			updatedAt: delegation.updatedAt.toISOString(),
+			completedAt: delegation.completedAt?.toISOString(),
+			artifactPath: isTerminalStatus(delegation.status) ? delegation.artifact.filePath : undefined,
+			unread: this.hasUnreadCompletion(delegation),
+		}
+	}
+
+	private buildLiveManifest(rootSessionID: string): DelegationManifest {
+		const delegations = Array.from(this.delegations.values())
+			.filter((delegation) => delegation.rootSessionID === rootSessionID)
+			.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+			.slice(0, LIVE_DELEGATION_MANIFEST_MAX_RECORDS)
+			.map((delegation) => this.toManifestRecord(delegation))
+
+		return {
+			version: LIVE_DELEGATION_MANIFEST_VERSION,
+			projectId: this.projectId ?? "unknown",
+			rootSessionID,
+			updatedAt: new Date().toISOString(),
+			delegations,
+		}
+	}
+
+	private async writeLiveManifest(rootSessionID: string): Promise<void> {
+		const manifestPath = this.getLiveManifestPath(rootSessionID)
+		const manifestDir = path.dirname(manifestPath)
+		const temporaryPath = path.join(
+			manifestDir,
+			`.${LIVE_DELEGATION_MANIFEST_FILE}.${process.pid}.${Date.now()}.tmp`,
+		)
+
+		await fs.mkdir(manifestDir, { recursive: true })
+		await fs.writeFile(
+			temporaryPath,
+			`${JSON.stringify(this.buildLiveManifest(rootSessionID), null, 2)}\n`,
+			"utf8",
+		)
+		await fs.rename(temporaryPath, manifestPath)
+	}
+
+	private persistLiveManifest(rootSessionID: string): Promise<void> {
+		const previousWrite = this.liveManifestWritesByRoot.get(rootSessionID) ?? Promise.resolve()
+		const nextWrite = previousWrite
+			.catch(() => undefined)
+			.then(() => this.writeLiveManifest(rootSessionID))
+			.catch((error) => {
+				void this.debugLog(
+					`Failed to persist live delegation manifest for ${rootSessionID}: ${error instanceof Error ? error.message : "Unknown error"}`,
+				)
+			})
+
+		this.liveManifestWritesByRoot.set(rootSessionID, nextWrite)
+		nextWrite.finally(() => {
+			if (this.liveManifestWritesByRoot.get(rootSessionID) === nextWrite) {
+				this.liveManifestWritesByRoot.delete(rootSessionID)
+			}
+		})
+
+		return nextWrite
+	}
+
+	private persistLiveManifestSoon(rootSessionID: string): void {
+		void this.persistLiveManifest(rootSessionID)
+	}
+
+	private persistLiveManifestForProgress(rootSessionID: string): void {
+		const now = Date.now()
+		const previousWriteAt = this.lastLiveManifestProgressWriteAtByRoot.get(rootSessionID) ?? 0
+		if (now - previousWriteAt < LIVE_DELEGATION_PROGRESS_WRITE_INTERVAL_MS) return
+
+		this.lastLiveManifestProgressWriteAtByRoot.set(rootSessionID, now)
+		this.persistLiveManifestSoon(rootSessionID)
+	}
+
 	private async waitForPersistedArtifact(
 		filePath: string,
 		maxWaitMs: number,
@@ -943,6 +2125,7 @@ export class DelegationManager {
 		if (!transitioned || !delegation) return
 
 		await this.debugLog(`finalizeDelegation(${delegation.id}, ${status}) started`)
+		await this.persistLiveManifest(delegation.rootSessionID)
 
 		const resolvedResult = await this.resolveDelegationResult(delegation)
 		delegation.result = resolvedResult
@@ -959,6 +2142,7 @@ export class DelegationManager {
 		}
 
 		await this.persistOutput(delegation, resolvedResult)
+		await this.persistLiveManifest(delegation.rootSessionID)
 		await this.notifyParent(delegation.id)
 	}
 
@@ -1066,8 +2250,10 @@ export class DelegationManager {
 		})
 
 		await this.debugLog(`Registered delegation ${delegation.id} before execution`)
+		await this.persistLiveManifest(delegation.rootSessionID)
 		this.scheduleTimeout(delegation.id)
-		this.markStarted(delegation.id)
+		const startedDelegation = this.markStarted(delegation.id)
+		if (startedDelegation) this.persistLiveManifestSoon(startedDelegation.rootSessionID)
 
 		// Fire the prompt (using prompt() instead of promptAsync() to properly initialize agent loop)
 		// Agent param is critical for MCP tools - tells OpenCode which agent's config to use
@@ -1202,6 +2388,8 @@ ${description}
 **ID:** ${delegation.id}
 **Agent:** ${delegation.agent}
 **Status:** ${delegation.status}
+**Project ID:** ${this.projectId ?? "unknown"}
+**Root Session:** ${delegation.rootSessionID}
 **Session:** ${delegation.sessionID}
 **Started:** ${(delegation.startedAt || delegation.createdAt).toISOString()}
 **Completed:** ${delegation.completedAt?.toISOString() || "N/A"}
@@ -1217,6 +2405,7 @@ ${description}
 				record.artifact.byteLength = stats.size
 				record.artifact.persistError = undefined
 			})
+			this.schedulePersistedSnapshotRefresh(delegation.rootSessionID, 8)
 
 			await this.debugLog(`Persisted output to ${delegation.artifact.filePath}`)
 		} catch (error) {
@@ -1234,10 +2423,7 @@ ${description}
 	 * Read a delegation's output by ID. Blocks if the delegation is still running.
 	 */
 	async readOutput(sessionID: string, id: string): Promise<string> {
-		const normalizedId = normalizeId(id)
-		if (!normalizedId) {
-			throw new Error("Delegation ID is required")
-		}
+		const normalizedId = parseGeneratedDelegationId(id)
 
 		const rootSessionID = await this.getRootSessionID(sessionID)
 		let delegation = this.delegations.get(normalizedId)
@@ -1245,12 +2431,17 @@ ${description}
 			delegation = undefined
 		}
 
-		const fallbackFilePath = path.join(
-			await this.getDelegationsDir(sessionID),
-			`${normalizedId}.md`,
+		const delegationRootDir = await this.getDelegationsDir(sessionID)
+		const fallbackFilePath = buildContainedDelegationArtifactPath(
+			delegationRootDir,
+			normalizedId,
 		)
 
 		const immediateArtifactPath = delegation?.artifact.filePath || fallbackFilePath
+		if (!isPathInsideDirectory(immediateArtifactPath, delegationRootDir)) {
+			throw new Error(`Invalid delegation artifact path for ID "${normalizedId}".`)
+		}
+
 		const immediateRead = await this.readPersistedArtifact(immediateArtifactPath)
 		if (immediateRead !== null) {
 			if (delegation) this.markRetrieved(delegation.id, sessionID)
@@ -1325,6 +2516,8 @@ ${description}
 						: "(no description)"),
 				agent: delegation.agent,
 				unread: this.hasUnreadCompletion(delegation),
+				startedAt: delegation.startedAt ?? delegation.createdAt,
+				completedAt: delegation.completedAt,
 			})
 		}
 
@@ -1334,42 +2527,15 @@ ${description}
 			const files = await fs.readdir(dir)
 
 			for (const file of files) {
-				if (file.endsWith(".md")) {
-					const id = file.replace(".md", "")
-					// Deduplicate: prioritize in-memory status
-					if (!results.find((r) => r.id === id)) {
-						// Try to read title, agent, description from file
-						let title = "(loaded from storage)"
-						let description = ""
-						let agent: string | undefined
-						let status: DelegationStatus = "complete"
-						try {
-							const filePath = path.join(dir, file)
-							const content = await fs.readFile(filePath, "utf8")
-							const titleMatch = content.match(/^# (.+)$/m)
-							if (titleMatch) title = titleMatch[1]
-							const agentMatch = content.match(/^\*\*Agent:\*\* (.+)$/m)
-							if (agentMatch) agent = agentMatch[1]
-							const statusMatch = content.match(/^\*\*Status:\*\* (.+)$/m)
-							status = parsePersistedStatus(statusMatch?.[1]?.trim())
-							// Get first paragraph after title as description
-							const lines = content.split("\n")
-							if (lines.length > 2 && lines[2]) {
-								description = lines[2].slice(0, 150)
-							}
-						} catch {
-							// Ignore read errors
-						}
-						results.push({
-							id,
-							status,
-							title,
-							description,
-							agent,
-							unread: false,
-						})
-					}
-				}
+				if (!file.endsWith(".md")) continue
+
+				const id = file.replace(".md", "")
+				// Deduplicate: prioritize in-memory status
+				if (results.find((r) => r.id === id)) continue
+
+				const filePath = path.join(dir, file)
+				const content = await this.readPersistedArtifactHeader(filePath)
+				results.push(this.parsePersistedDelegationHeader(id, content))
 			}
 		} catch {
 			// Directory may not exist yet
@@ -1377,6 +2543,93 @@ ${description}
 
 		results.sort((a, b) => a.id.localeCompare(b.id))
 		return results
+	}
+
+	private getCachedPersistedSnapshots(rootSessionID: string): DelegationSnapshotItem[] {
+		return this.persistedSnapshotCacheByRoot.get(rootSessionID)?.items ?? []
+	}
+
+	async getSnapshotRefreshError(sessionID: string): Promise<string | undefined> {
+		const rootSessionID = await this.getRootSessionID(sessionID)
+		return this.persistedSnapshotCacheByRoot.get(rootSessionID)?.lastRefreshError
+	}
+
+	private schedulePersistedSnapshotRefresh(rootSessionID: string, limit: number): void {
+		const existing = this.persistedSnapshotCacheByRoot.get(rootSessionID)
+		const now = Date.now()
+		if (existing?.refreshPromise) return
+		if (existing && now - existing.refreshedAtMs < TUI_PERSISTED_SNAPSHOT_REFRESH_MS) return
+
+		const cache = existing ?? { items: [], refreshedAtMs: 0 }
+		this.persistedSnapshotCacheByRoot.set(rootSessionID, cache)
+
+		cache.refreshPromise = this.refreshPersistedSnapshotCache(rootSessionID, limit)
+			.then(() => {
+				cache.lastRefreshError = undefined
+			})
+			.catch((error) => {
+				const message = error instanceof Error ? error.message : "Unknown error"
+				cache.lastRefreshError = message
+				cache.refreshedAtMs = Date.now()
+				void this.debugLog(
+					`TUI persisted snapshot refresh failed for ${rootSessionID}: ${message}`,
+				)
+			})
+			.finally(() => {
+				cache.refreshPromise = undefined
+			})
+	}
+
+	private async listRecentPersistedArtifactFiles(
+		dir: string,
+		readLimit: number,
+	): Promise<PersistedArtifactFile[]> {
+		return await listRecentPersistedArtifactFiles(dir, readLimit)
+	}
+
+	private async refreshPersistedSnapshotCache(rootSessionID: string, limit: number): Promise<void> {
+		const dir = this.getRootDelegationsDir(rootSessionID)
+		const readLimit = Math.min(Math.max(limit * 4, limit, 1), TUI_PERSISTED_READ_LIMIT)
+		const artifactFiles = await this.listRecentPersistedArtifactFiles(dir, readLimit)
+
+		const persistedItems: DelegationSnapshotItem[] = []
+		for (const file of artifactFiles) {
+			const content = await this.readPersistedArtifactHeader(file.filePath)
+			const snapshotItem = this.toSnapshotItemFromListItem(
+				this.parsePersistedDelegationHeader(file.id, content),
+			)
+			if (snapshotItem) persistedItems.push(snapshotItem)
+		}
+
+		const cache = this.persistedSnapshotCacheByRoot.get(rootSessionID) ?? {
+			items: [],
+			refreshedAtMs: 0,
+		}
+		cache.items = persistedItems.sort((a, b) => b.updatedAtMs - a.updatedAtMs).slice(0, readLimit)
+		cache.refreshedAtMs = Date.now()
+		this.persistedSnapshotCacheByRoot.set(rootSessionID, cache)
+	}
+
+	async getSnapshot(sessionID: string, limit = 8): Promise<DelegationSnapshotItem[]> {
+		const rootSessionID = await this.getRootSessionID(sessionID)
+		const inMemorySnapshots = Array.from(this.delegations.values())
+			.filter((delegation) => this.isVisibleToSession(delegation, rootSessionID))
+			.map((delegation) => this.toSnapshotItem(delegation))
+
+		const snapshotsById = new Map(inMemorySnapshots.map((item) => [item.id, item]))
+		for (const persistedSnapshot of this.getCachedPersistedSnapshots(rootSessionID)) {
+			if (snapshotsById.has(persistedSnapshot.id)) continue
+			snapshotsById.set(persistedSnapshot.id, persistedSnapshot)
+		}
+
+		this.schedulePersistedSnapshotRefresh(rootSessionID, limit)
+
+		return Array.from(snapshotsById.values())
+			.sort((a, b) => {
+				if (a.isActive !== b.isActive) return a.isActive ? -1 : 1
+				return b.updatedAtMs - a.updatedAtMs
+			})
+			.slice(0, limit)
 	}
 
 	/**
@@ -1388,6 +2641,7 @@ ${description}
 		const delegation = this.delegations.get(normalizedId)
 
 		if (delegation) {
+			const rootSessionID = delegation.rootSessionID
 			if (isActiveStatus(delegation.status)) {
 				try {
 					await this.client.session.delete({
@@ -1403,6 +2657,7 @@ ${description}
 			this.terminalWaiters.delete(delegation.id)
 			this.delegationsBySession.delete(delegation.sessionID)
 			this.delegations.delete(delegation.id)
+			await this.persistLiveManifest(rootSessionID)
 		}
 
 		// Remove from filesystem
@@ -1429,7 +2684,8 @@ ${description}
 	handleMessageEvent(sessionID: string, messageText?: string): void {
 		const delegation = this.findBySession(sessionID)
 		if (!delegation) return
-		this.markProgress(delegation.id, messageText)
+		const updatedDelegation = this.markProgress(delegation.id, messageText)
+		if (updatedDelegation) this.persistLiveManifestForProgress(updatedDelegation.rootSessionID)
 	}
 
 	/**
@@ -1674,7 +2930,7 @@ interface DelegationForContext {
  * Includes running delegations with notification reminder (only when running exist),
  * and recent completed delegations with full descriptions.
  */
-export function formatDelegationContext(
+function formatDelegationContext(
 	running: DelegationForContext[],
 	unreadCompleted: DelegationForContext[],
 ): string {
@@ -1768,7 +3024,11 @@ export const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 	// Ensure base directory exists (for debug logs etc)
 	await fs.mkdir(baseDir, { recursive: true })
 
-	const manager = new DelegationManager(client as OpencodeClient, baseDir, log)
+	const manager = new DelegationManager(client as OpencodeClient, baseDir, log, {
+		projectId,
+		projectDirectory: directory,
+	})
+	setActiveDelegationManager(manager)
 
 	await manager.debugLog("BackgroundAgentsPlugin initialized with delegation system")
 
